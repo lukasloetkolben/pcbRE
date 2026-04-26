@@ -163,13 +163,13 @@ class App:
     def _build_status_area(self) -> None:
         self.status = ttk.Label(self.root, text="Load a top and bottom image to begin.")
         self.status.pack(fill="x", padx=8, pady=(4, 0))
-        self.hint = ttk.Label(self.root, foreground="#666", text="")
+        self.hint = ttk.Label(self.root, foreground="#888", text="")
         self.hint.pack(fill="x", padx=8)
 
     def _build_bottom_bar(self) -> None:
         bar = ttk.Frame(self.root, padding=(8, 4))
         bar.pack(side="bottom", fill="x")
-        self.shortcut_bar = ttk.Label(bar, foreground="#444", text="")
+        self.shortcut_bar = ttk.Label(bar, foreground="#888", text="")
         self.shortcut_bar.pack(side="left")
         # Frame+Label so the bg color fills the whole button on macOS (tk.Button
         # ignores `bg` under Aqua; even tk.Label can leave a grey margin from
@@ -1012,7 +1012,7 @@ class App:
         size_lbl = ttk.Label(size_row, text=f"{pad.r}px", width=6)
         size_lbl.pack(side="left", padx=(6, 0))
 
-        ttk.Label(frm, text=f"Side: {pad.side.upper()}", foreground="#666").grid(
+        ttk.Label(frm, text=f"Side: {pad.side.upper()}", foreground="#888").grid(
             row=5, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
 
         def pick_color():
@@ -1135,7 +1135,7 @@ class App:
         h_lbl = ttk.Label(h_row, text=f"{region.h}px", width=7)
         h_lbl.pack(side="left", padx=(6, 0))
 
-        ttk.Label(frm, text=f"Side: {region.side.upper()}", foreground="#666").grid(
+        ttk.Label(frm, text=f"Side: {region.side.upper()}", foreground="#888").grid(
             row=6, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
 
         def pick_color():
