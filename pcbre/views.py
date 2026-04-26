@@ -14,6 +14,21 @@ from .model import Pad, Point, Region, Side, hex_to_rgb, random_pad_color
 PANEL_W, PANEL_H = 640, 720
 OVERLAY_W, OVERLAY_H = 1300, 760
 WHEEL_FACTOR = 1.18
+# Cross-platform fallbacks for the pan/grab cursors. Tk on Aqua supports
+# openhand/closedhand natively; X11 has hand1/hand2; "fleur" works everywhere.
+PAN_CURSORS_OPEN = ("openhand", "hand2", "fleur")
+PAN_CURSORS_GRAB = ("closedhand", "hand1", "fleur")
+DEFAULT_CANVAS_CURSOR = "crosshair"
+
+
+def set_canvas_cursor(canvas: tk.Canvas, candidates) -> None:
+    """Set the first cursor name from `candidates` that the platform accepts."""
+    for name in candidates if isinstance(candidates, tuple) else (candidates,):
+        try:
+            canvas.config(cursor=name)
+            return
+        except tk.TclError:
+            continue
 MIN_ZOOM = 0.05
 MAX_ZOOM = 80.0
 RADIUS_MIN = 2
@@ -326,6 +341,7 @@ class Panel(ImageView):
             self._press_orig = None
             self._press_canvas = None
             self._pan_start(e)
+            set_canvas_cursor(self.canvas, PAN_CURSORS_GRAB)
             return
         self._press_orig = (ox, oy)
         self._press_canvas = (e.x, e.y)
@@ -360,6 +376,11 @@ class Panel(ImageView):
             return
         if self._pan_anchor is not None:
             self._pan_anchor = None
+            # If space is still held the user is staged for another pan, so
+            # show the open hand again; otherwise restore the default cursor.
+            set_canvas_cursor(
+                self.canvas,
+                PAN_CURSORS_OPEN if self.space_held else DEFAULT_CANVAS_CURSOR)
             return
         if self._press_orig is not None and self._long_press.ready:
             ox, oy = self._press_orig
@@ -874,6 +895,7 @@ class OverlayView(ImageView):
         # Spacebar held → drag pans the canvas.
         if self.space_held:
             self._pan_start(e)
+            set_canvas_cursor(self.canvas, PAN_CURSORS_GRAB)
             return
 
         # Default: arm long-press for pad placement and remember the press
@@ -1001,6 +1023,9 @@ class OverlayView(ImageView):
             self._pan_anchor = None
             self._press_view = None
             self._press_canvas = None
+            set_canvas_cursor(
+                self.canvas,
+                PAN_CURSORS_OPEN if self.space_held else DEFAULT_CANVAS_CURSOR)
             return
 
         # Long-press: pad placement on a clean hold-and-release.

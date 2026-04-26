@@ -24,12 +24,15 @@ from .model import (
     normalize_side,
 )
 from .views import (
+    DEFAULT_CANVAS_CURSOR,
     OverlayView,
+    PAN_CURSORS_OPEN,
     Panel,
     RADIUS_MAX,
     RADIUS_MIN,
     REGION_MAX,
     REGION_MIN,
+    set_canvas_cursor,
 )
 
 DEFAULT_RADIUS = 8
@@ -251,6 +254,17 @@ class App:
         # Figma convention) instead of placing a pad or starting a region.
         self.root.bind("<KeyPress-space>", self._on_space_press)
         self.root.bind("<KeyRelease-space>", self._on_space_release)
+        # Tk's default class binding invokes a focused button on KeyRelease-space,
+        # which would fire (e.g.) "Open Project" the moment the user hits space
+        # for panning. Replace those class bindings with no-ops; the root-level
+        # handler above still fires for the actual pan toggle.
+        for cls in ("TButton", "TCheckbutton", "TRadiobutton", "TMenubutton",
+                    "Button", "Checkbutton", "Radiobutton"):
+            for ev in ("<KeyPress-space>", "<KeyRelease-space>"):
+                try:
+                    self.root.bind_class(cls, ev, lambda e: None)
+                except tk.TclError:
+                    pass
 
     def _all_views(self) -> list:
         return [self.panel_top, self.panel_bottom,
@@ -260,11 +274,17 @@ class App:
         if self._focused_in_text_input():
             return
         for v in self._all_views():
-            v.space_held = True
+            if not v.space_held:
+                v.space_held = True
+                # Open hand → "you can grab and pan from here". The View flips
+                # to closedhand on the actual press and back when released.
+                set_canvas_cursor(v.canvas, PAN_CURSORS_OPEN)
 
     def _on_space_release(self, e=None) -> None:
         for v in self._all_views():
-            v.space_held = False
+            if v.space_held:
+                v.space_held = False
+                set_canvas_cursor(v.canvas, DEFAULT_CANVAS_CURSOR)
 
     def _kb_zoom(self, factor: float) -> None:
         try:
