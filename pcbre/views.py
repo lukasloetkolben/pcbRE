@@ -124,10 +124,14 @@ class ImageView:
         factor = _wheel_factor(e)
         if factor is None:
             return
-        sx, sy = self.canvas_to_orig(e.x, e.y)
+        self._zoom_at(e.x, e.y, factor)
+
+    def _zoom_at(self, cx: int, cy: int, factor: float) -> None:
+        """Zoom by `factor` keeping the original-image pixel under (cx, cy) fixed."""
+        sx, sy = self.canvas_to_orig(cx, cy)
         self.zoom = float(np.clip(self.zoom * factor, MIN_ZOOM, MAX_ZOOM))
-        self.ox = sx - e.x / self.zoom
-        self.oy = sy - e.y / self.zoom
+        self.ox = sx - cx / self.zoom
+        self.oy = sy - cy / self.zoom
         self.schedule_draw()
 
     def _pan_start(self, e) -> None:
@@ -526,6 +530,14 @@ class OverlayView(ImageView):
         self.on_region_deselect = on_region_deselect or (lambda: None)
         self.on_double_click_region = on_double_click_region or (lambda i: None)
 
+        # Cache for the cropped-and-resized base images. The resize from a
+        # multi-megapixel source to canvas resolution is the dominant cost per
+        # frame, and it doesn't depend on alpha — so we reuse it across opacity
+        # drags. Keyed on view bounds + zoom + image identity.
+        self._scaled_cache_key: tuple | None = None
+        self._scaled_cache_top: Image.Image | None = None
+        self._scaled_cache_warped: Image.Image | None = None
+
         self._press_view: tuple[float, float] | None = None
         self._drag_pad: int | None = None
         self._drag_region: int | None = None
@@ -638,13 +650,22 @@ class OverlayView(ImageView):
         self.top = top
         self.warped = warped
         self._rebuild_views()
+        self._invalidate_scaled_cache()
         self._fitted_once = False
         self.canvas.update_idletasks()
         self.fit()
 
     def set_alpha(self, a: float) -> None:
         self.alpha = float(a)
-        self.schedule_draw()
+        # Single-source views don't blend, and side visibility is independent
+        # of alpha there, so we don't need to redraw them on opacity changes.
+        if self.single_source is None:
+            self.schedule_draw()
+
+    def _invalidate_scaled_cache(self) -> None:
+        self._scaled_cache_key = None
+        self._scaled_cache_top = None
+        self._scaled_cache_warped = None
 
     def rotate_cw(self) -> None:
         self.rotation = (self.rotation + 90) % 360
@@ -658,6 +679,7 @@ class OverlayView(ImageView):
         if self.top is None or self.warped is None:
             return
         self._rebuild_views()
+        self._invalidate_scaled_cache()
         self._fitted_once = False
         self.fit()
 
@@ -1063,24 +1085,47 @@ class OverlayView(ImageView):
     def _draw_content(self, ix0: int, iy0: int, ix1: int, iy1: int) -> None:
         new_w = max(1, int(round((ix1 - ix0) * self.zoom)))
         new_h = max(1, int(round((iy1 - iy0) * self.zoom)))
+        crop_t, crop_w = self._scaled_crops(ix0, iy0, ix1, iy1, new_w, new_h)
         if self.single_source is None:
-            crop_t = self._top_view.crop((ix0, iy0, ix1, iy1))
-            crop_w = self._warped_view.crop((ix0, iy0, ix1, iy1))
-            if (new_w, new_h) != crop_t.size:
-                crop_t = crop_t.resize((new_w, new_h), BILINEAR)
-                crop_w = crop_w.resize((new_w, new_h), BILINEAR)
             blend = Image.blend(crop_t, crop_w, self.alpha)
         else:
-            src = self._top_view if self.single_source == "top" else self._warped_view
-            blend = src.crop((ix0, iy0, ix1, iy1))
-            if (new_w, new_h) != blend.size:
-                blend = blend.resize((new_w, new_h), BILINEAR)
+            blend = crop_t  # safe: _composite_overlays returns a fresh image
         if self.pads or self.regions:
             blend = self._composite_overlays(blend, ix0, iy0, new_w, new_h)
         self._photo = ImageTk.PhotoImage(blend)
         cx0 = (ix0 - self.ox) * self.zoom
         cy0 = (iy0 - self.oy) * self.zoom
         self.canvas.create_image(cx0, cy0, anchor="nw", image=self._photo)
+
+    def _scaled_crops(self, ix0: int, iy0: int, ix1: int, iy1: int,
+                      new_w: int, new_h: int) -> tuple[Image.Image, Image.Image | None]:
+        """Cropped + resized view-space images, cached so opacity drags are cheap.
+
+        For single-source views the second tuple element is None; for blended
+        views both crops are returned at the canvas-target size (new_w, new_h).
+        """
+        key = (ix0, iy0, ix1, iy1, new_w, new_h,
+               id(self._top_view), id(self._warped_view), self.single_source)
+        if key == self._scaled_cache_key:
+            return self._scaled_cache_top, self._scaled_cache_warped
+
+        if self.single_source is None:
+            crop_t = self._top_view.crop((ix0, iy0, ix1, iy1))
+            crop_w = self._warped_view.crop((ix0, iy0, ix1, iy1))
+            if (new_w, new_h) != crop_t.size:
+                crop_t = crop_t.resize((new_w, new_h), BILINEAR)
+                crop_w = crop_w.resize((new_w, new_h), BILINEAR)
+        else:
+            src = self._top_view if self.single_source == "top" else self._warped_view
+            crop_t = src.crop((ix0, iy0, ix1, iy1))
+            if (new_w, new_h) != crop_t.size:
+                crop_t = crop_t.resize((new_w, new_h), BILINEAR)
+            crop_w = None
+
+        self._scaled_cache_key = key
+        self._scaled_cache_top = crop_t
+        self._scaled_cache_warped = crop_w
+        return crop_t, crop_w
 
     def _composite_overlays(self, blend: Image.Image,
                             ix0: int, iy0: int,

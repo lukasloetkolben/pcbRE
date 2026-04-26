@@ -40,6 +40,13 @@ ALIGN_DISABLED_BG = "#d1d1d6"
 ALIGN_DISABLED_FG = "#6c6c70"
 
 _DELETE_KEY_HINT = "Backspace" if sys.platform == "darwin" else "Del"
+_MOD_KEY = "Cmd" if sys.platform == "darwin" else "Ctrl"
+_DEFAULT_SHORTCUTS = (
+    f"{_MOD_KEY}+= / {_MOD_KEY}+-  zoom    ·    "
+    f"{_MOD_KEY}+0  fit    ·    "
+    f"{_MOD_KEY}+S  save    ·    "
+    f"{_MOD_KEY}+O  open"
+)
 
 
 class App:
@@ -245,6 +252,39 @@ class App:
         self.root.bind("<KeyPress-E>", self._on_e_key)
         for seq in ("<Delete>", "<BackSpace>", "<KP_Delete>"):
             self.root.bind(seq, self._on_delete_key)
+        # Cmd/Ctrl + = / + / - / 0 → zoom in / zoom out / fit, centered on the
+        # canvas under the cursor (or the active overlay's center as fallback).
+        for seq in ("<Command-equal>", "<Command-plus>",
+                    "<Control-equal>", "<Control-plus>"):
+            self.root.bind(seq, lambda e: self._kb_zoom(1.18))
+        for seq in ("<Command-minus>", "<Control-minus>"):
+            self.root.bind(seq, lambda e: self._kb_zoom(1 / 1.18))
+        for seq in ("<Command-0>", "<Control-0>"):
+            self.root.bind(seq, lambda e: self.fit_views())
+
+    def _kb_zoom(self, factor: float) -> None:
+        try:
+            x = self.root.winfo_pointerx()
+            y = self.root.winfo_pointery()
+            target = self.root.winfo_containing(x, y)
+        except tk.TclError:
+            target = None
+        views = (self.panel_top, self.panel_bottom,
+                 self.overlay, self.overlay_left, self.overlay_right)
+        for v in views:
+            if target is v.canvas:
+                cx = x - v.canvas.winfo_rootx()
+                cy = y - v.canvas.winfo_rooty()
+                v._zoom_at(cx, cy, factor)
+                return
+        for v in views:
+            try:
+                if v.canvas.winfo_ismapped():
+                    v._zoom_at(v.canvas.winfo_width() // 2,
+                               v.canvas.winfo_height() // 2, factor)
+                    return
+            except tk.TclError:
+                pass
 
     # ---------------------------------------------------------- mode bars
 
@@ -341,7 +381,7 @@ class App:
                 text=f"Selected point #{idx + 1} ({side.upper()})   "
                      f"·   {_DELETE_KEY_HINT} delete pair")
         else:
-            self.shortcut_bar.config(text="")
+            self.shortcut_bar.config(text=_DEFAULT_SHORTCUTS)
 
     def _focused_in_text_input(self) -> bool:
         focused = self.root.focus_get()
