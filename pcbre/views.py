@@ -277,6 +277,9 @@ class Panel(ImageView):
         self._drag_idx: int | None = None
         self._drag_moved = False
         self._long_press = LongPress(self.canvas)
+        # Set by App when the spacebar is held — primary-button drag pans the
+        # canvas (Photoshop/Figma convention) instead of placing a point.
+        self.space_held = False
 
         c = self.canvas
         c.bind("<ButtonPress-1>", self._on_press)
@@ -316,12 +319,18 @@ class Panel(ImageView):
             self._press_canvas = None
             self._long_press.cancel()
             self.on_grab(self.side, hit)
-        else:
-            self._drag_idx = None
-            self._press_orig = (ox, oy)
-            self._press_canvas = (e.x, e.y)
-            color = POINT_COLORS[len(self.points) % len(POINT_COLORS)]
-            self._long_press.start(e.x, e.y, color=color)
+            return
+        self._drag_idx = None
+        if self.space_held:
+            # Space+drag = pan, no point placement.
+            self._press_orig = None
+            self._press_canvas = None
+            self._pan_start(e)
+            return
+        self._press_orig = (ox, oy)
+        self._press_canvas = (e.x, e.y)
+        color = POINT_COLORS[len(self.points) % len(POINT_COLORS)]
+        self._long_press.start(e.x, e.y, color=color)
 
     def _on_motion(self, e) -> None:
         if self.image is None:
@@ -332,6 +341,9 @@ class Panel(ImageView):
             ox = float(np.clip(ox, 0, self.image.width - 1))
             oy = float(np.clip(oy, 0, self.image.height - 1))
             self.on_move(self.side, self._drag_idx, ox, oy)
+            return
+        if self._pan_anchor is not None:
+            self._pan_drag(e)
             return
         if self._press_canvas is not None and self._long_press.active:
             cx, cy = self._press_canvas
@@ -345,6 +357,9 @@ class Panel(ImageView):
             if self._drag_moved:
                 self.on_drop(self.side, self._drag_idx)
             self._drag_idx = None
+            return
+        if self._pan_anchor is not None:
+            self._pan_anchor = None
             return
         if self._press_orig is not None and self._long_press.ready:
             ox, oy = self._press_orig
@@ -503,7 +518,9 @@ class OverlayView(ImageView):
         self.rotation = 0
         self.flipped = False
         self.single_source = single_source  # None | "top" | "warped"
-        self.tool_mode: str = "pad"  # "pad" | "region"
+        # Set by App when the spacebar is held — primary-button drag pans the
+        # canvas (Photoshop/Figma convention) instead of starting a region.
+        self.space_held = False
 
         # Pads live in TOP-image coordinates so they survive view rotation/flip.
         self.pads: list[Pad] = []
@@ -539,6 +556,7 @@ class OverlayView(ImageView):
         self._scaled_cache_warped: Image.Image | None = None
 
         self._press_view: tuple[float, float] | None = None
+        self._press_canvas: tuple[int, int] | None = None
         self._drag_pad: int | None = None
         self._drag_region: int | None = None
         self._region_resize_idx: int | None = None
@@ -586,9 +604,6 @@ class OverlayView(ImageView):
             self.on_double_click_region(region_hit)
             return
         self.fit()
-
-    def set_tool_mode(self, mode: str) -> None:
-        self.tool_mode = "region" if mode == "region" else "pad"
 
     # -- view content --------------------------------------------------------
 
@@ -856,17 +871,18 @@ class OverlayView(ImageView):
             self.selected_region = None
             self.on_region_deselect()
 
-        if self.tool_mode == "region":
-            self._region_create_start = (vx, vy)
-            self._region_create_end = (vx, vy)
-            self._pending_region_color = random_pad_color()
-            self.schedule_draw()
+        # Spacebar held → drag pans the canvas.
+        if self.space_held:
+            self._pan_start(e)
             return
 
-        # Pad mode default: arm long-press for placement, allow pan on motion.
+        # Default: arm long-press for pad placement and remember the press
+        # position so a motion past CLICK_THRESHOLD can promote the gesture
+        # into region creation.
         self._press_view = (vx, vy)
-        self._pan_anchor = (e.x, e.y, self.ox, self.oy)
+        self._press_canvas = (e.x, e.y)
         self._pending_pad_color = random_pad_color()
+        self._pending_region_color = self._pending_pad_color
         target_r = self.next_pad_radius * self.zoom
         self._long_press.start(e.x, e.y, color=self._pending_pad_color,
                                target_r=target_r)
@@ -905,26 +921,33 @@ class OverlayView(ImageView):
             new_y = self._region_drag_orig_xy[1] + dy
             self.on_move_region(self._drag_region, new_x, new_y)
             return
-        if self._region_create_start is not None:
-            self._click_moved = True
-            self._region_create_end = self.canvas_to_orig(e.x, e.y)
-            self.schedule_draw()
-            return
         if self._drag_pad is not None:
             self._click_moved = True
             vx, vy = self.canvas_to_orig(e.x, e.y)
             tx, ty = self.view_to_top(vx, vy)
             self.on_move_pad(self._drag_pad, tx, ty)
             return
-        if self._pan_anchor is None:
+        if self._region_create_start is not None:
+            self._click_moved = True
+            self._region_create_end = self.canvas_to_orig(e.x, e.y)
+            self.schedule_draw()
             return
-        x0, y0, _, _ = self._pan_anchor
-        if not self._click_moved:
+        if self._pan_anchor is not None:
+            self._click_moved = True
+            self._pan_drag(e)
+            return
+        # Default empty press: motion past the click threshold cancels the
+        # long-press and starts region creation from the original press point.
+        if self._press_canvas is not None and self._press_view is not None:
+            x0, y0 = self._press_canvas
             if abs(e.x - x0) <= self.CLICK_THRESHOLD and abs(e.y - y0) <= self.CLICK_THRESHOLD:
                 return
             self._click_moved = True
             self._long_press.cancel()
-        self._pan_drag(e)
+            self._region_create_start = self._press_view
+            self._region_create_end = self.canvas_to_orig(e.x, e.y)
+            self._press_canvas = None
+            self.schedule_draw()
 
     def _on_release(self, e) -> None:
         # Region resize: notify app once at end so any clamping/bookkeeping fires.
@@ -937,12 +960,23 @@ class OverlayView(ImageView):
             self._region_resize_idx = None
             self._region_resize_start_rect = None
             self._press_view = None
+            self._press_canvas = None
             return
 
         # Region drag: moves were applied live; nothing extra to commit here.
         if self._drag_region is not None:
             self._drag_region = None
             self._press_view = None
+            self._press_canvas = None
+            return
+
+        # Pad drag drop.
+        if self._drag_pad is not None:
+            if self._click_moved:
+                self.on_drop_pad(self._drag_pad)
+            self._drag_pad = None
+            self._press_view = None
+            self._press_canvas = None
             return
 
         # Region creation: commit if the rectangle is big enough.
@@ -958,24 +992,25 @@ class OverlayView(ImageView):
                 self.on_place_region(cx, cy, w, h, self._detect_side(),
                                      self._pending_region_color)
             self.schedule_draw()
+            self._press_view = None
+            self._press_canvas = None
             return
 
-        # Pad: long-press placement OR drop after drag.
-        place_args = None
-        if (self._long_press.ready
-                and self._press_view is not None and self._drag_pad is None):
+        # Pan release (spacebar drag, or any other path that set _pan_anchor).
+        if self._pan_anchor is not None:
+            self._pan_anchor = None
+            self._press_view = None
+            self._press_canvas = None
+            return
+
+        # Long-press: pad placement on a clean hold-and-release.
+        if self._long_press.ready and self._press_view is not None:
             vx, vy = self._press_view
             tx, ty = self.view_to_top(vx, vy)
-            place_args = (tx, ty, self._detect_side(), self._pending_pad_color)
+            self.on_place_pad(tx, ty, self._detect_side(), self._pending_pad_color)
         self._long_press.cancel()
-        if self._drag_pad is not None:
-            if self._click_moved:
-                self.on_drop_pad(self._drag_pad)
-            self._drag_pad = None
-        elif place_args is not None:
-            self.on_place_pad(*place_args)
         self._press_view = None
-        self._pan_anchor = None
+        self._press_canvas = None
 
     def _update_region_resize(self, e) -> None:
         idx = self._region_resize_idx

@@ -42,10 +42,8 @@ ALIGN_DISABLED_FG = "#6c6c70"
 _DELETE_KEY_HINT = "Backspace" if sys.platform == "darwin" else "Del"
 _MOD_KEY = "Cmd" if sys.platform == "darwin" else "Ctrl"
 _DEFAULT_SHORTCUTS = (
-    f"{_MOD_KEY}+= / {_MOD_KEY}+-  zoom    ·    "
-    f"{_MOD_KEY}+0  fit    ·    "
-    f"{_MOD_KEY}+S  save    ·    "
-    f"{_MOD_KEY}+O  open"
+    "hold to place pad   ·   drag to draw region   ·   Space+drag to pan   ·   "
+    f"{_MOD_KEY}+= / {_MOD_KEY}+-  zoom   ·   {_MOD_KEY}+0  fit"
 )
 
 
@@ -73,8 +71,6 @@ class App:
         self.radius = tk.DoubleVar(value=DEFAULT_RADIUS)
         # New projects open straight into overlay once alignment is in place.
         self.mode = tk.StringVar(value="overlay")
-        # Place tool: "pad" (long-press to drop) or "region" (drag to box).
-        self.tool_mode = tk.StringVar(value="pad")
 
         self.selected: tuple[Side, int] | None = None
         self._suppress_radius = False
@@ -150,15 +146,6 @@ class App:
         ttk.Label(o, text="Opacity:").pack(side="left", padx=(0, 4))
         ttk.Scale(o, from_=0.0, to=1.0, variable=self.opacity, orient="horizontal",
                   length=200, command=lambda *_: self.on_opacity_change()).pack(side="left")
-        ttk.Separator(o, orient="vertical").pack(side="left", fill="y", padx=10)
-
-        ttk.Label(o, text="Place:").pack(side="left", padx=(0, 4))
-        for label, value in (("Pad", "pad"), ("Region", "region")):
-            ttk.Radiobutton(
-                o, text=label, value=value, variable=self.tool_mode,
-                style="Toolbutton",
-                command=self._on_tool_mode_change,
-            ).pack(side="left")
 
     def _build_status_area(self) -> None:
         self.status = ttk.Label(self.root, text="Load a top and bottom image to begin.")
@@ -238,7 +225,6 @@ class App:
         self.overlay_left.regions = self.overlay.regions
         self.overlay_right.regions = self.overlay.regions
         self._set_last_pad_radius(self._last_pad_radius)
-        self._on_tool_mode_change()
 
     def _bind_keys(self) -> None:
         for seq, fn in [
@@ -261,6 +247,24 @@ class App:
             self.root.bind(seq, lambda e: self._kb_zoom(1 / 1.18))
         for seq in ("<Command-0>", "<Control-0>"):
             self.root.bind(seq, lambda e: self.fit_views())
+        # Spacebar held → primary-button drag pans the canvas (Photoshop /
+        # Figma convention) instead of placing a pad or starting a region.
+        self.root.bind("<KeyPress-space>", self._on_space_press)
+        self.root.bind("<KeyRelease-space>", self._on_space_release)
+
+    def _all_views(self) -> list:
+        return [self.panel_top, self.panel_bottom,
+                self.overlay, self.overlay_left, self.overlay_right]
+
+    def _on_space_press(self, e=None) -> None:
+        if self._focused_in_text_input():
+            return
+        for v in self._all_views():
+            v.space_held = True
+
+    def _on_space_release(self, e=None) -> None:
+        for v in self._all_views():
+            v.space_held = False
 
     def _kb_zoom(self, factor: float) -> None:
         try:
@@ -295,10 +299,9 @@ class App:
             if not self.op_bar.winfo_ismapped():
                 self.op_bar.pack(fill="x")
             self.hint.config(text=(
-                "scroll = zoom · right/middle/Shift+drag = pan · "
-                "double-click = fit · hold ~0.3 s = pad · "
-                "Region tool: drag a box · Alt+scroll on pad = resize · "
-                "drag a dot on the selected region to resize"))
+                "scroll = zoom · Space+drag / right / middle / Shift+drag = pan · "
+                "hold ~0.3 s = pad · drag = region · "
+                "Alt+scroll on pad = resize · drag a dot to resize a region"))
             # Side-by-side view only makes sense with two images.
             if self.single_image_mode:
                 self.view_switcher.pack_forget()
@@ -930,11 +933,6 @@ class App:
 
     def on_region_deselect(self) -> None:
         self._set_selected_region(None)
-
-    def _on_tool_mode_change(self) -> None:
-        mode = self.tool_mode.get()
-        for v in self._pad_views():
-            v.set_tool_mode(mode)
 
     # ----------------------------------------------------- pad-view helpers
 
