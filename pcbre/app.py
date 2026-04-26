@@ -83,8 +83,31 @@ class App:
         self._pad_editor_geometry: str | None = None
         self._last_region_opacity = 0.3
         self._region_editor_geometry: str | None = None
+        self._dirty = False
 
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _mark_dirty(self) -> None:
+        self._dirty = True
+
+    def _on_close(self) -> None:
+        if not self._dirty:
+            self.root.destroy()
+            return
+        answer = messagebox.askyesnocancel(
+            "Unsaved changes",
+            "You have unsaved changes. Save before closing?",
+            parent=self.root)
+        if answer is None:
+            return  # Cancel — stay open.
+        if answer:
+            self.save_project()
+            if self._dirty:
+                # Save was cancelled, failed, or required input that the user
+                # backed out of — don't lose the window in that case.
+                return
+        self.root.destroy()
 
     # ----------------------------------------------------------------- UI
 
@@ -352,6 +375,7 @@ class App:
             messagebox.showinfo("No top image",
                                 "Load a top image first.")
             return
+        self._mark_dirty()
         self.single_image_mode = True
         self.transform = np.eye(3)
         self.warped_bottom = self.panel_top.image
@@ -439,6 +463,7 @@ class App:
             return
         del self.overlay.pads[idx]
         self._set_selected_pad(None)
+        self._mark_dirty()
 
     def _delete_selected_region(self) -> None:
         idx = self.overlay.selected_region
@@ -446,6 +471,7 @@ class App:
             return
         del self.overlay.regions[idx]
         self._set_selected_region(None)
+        self._mark_dirty()
 
     def _delete_selected_point_pair(self) -> None:
         if self.selected is None:
@@ -458,6 +484,7 @@ class App:
         self._invalidate_alignment()
         self.panel_top.draw(); self.panel_bottom.draw()
         self._update_status()
+        self._mark_dirty()
 
     # -------------------------------------------------------------- file I/O
 
@@ -487,6 +514,7 @@ class App:
         self._select(None, None)
         self._invalidate_alignment()
         self._update_status()
+        self._mark_dirty()
 
     def load_bottom(self) -> None:
         if self._warn_locked("load a new bottom image"):
@@ -504,6 +532,7 @@ class App:
         self._select(None, None)
         self._invalidate_alignment()
         self._update_status()
+        self._mark_dirty()
 
     def on_mirror_toggle(self) -> None:
         if self._suppress_mirror:
@@ -528,6 +557,7 @@ class App:
         self.panel_bottom.draw()
         self._invalidate_alignment()
         self._update_status()
+        self._mark_dirty()
 
     # --------------------------------------------------------- project I/O
 
@@ -622,6 +652,7 @@ class App:
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("Could not save project", str(e))
             return
+        self._dirty = False
         self.status.config(text=f"Saved project: {path}")
 
     @staticmethod
@@ -733,6 +764,9 @@ class App:
         else:
             self.status.config(text=f"Opened project: {path}")
         self._update_status()
+        # Helpers above (enter_single_image_mode, align, set_mode) flip the
+        # dirty flag — clear it so an opened project starts clean.
+        self._dirty = False
 
     def _load_points(self, align_pts: dict) -> None:
         try:
@@ -819,6 +853,7 @@ class App:
         panel.points.append(Point(int(round(ox)), int(round(oy)), r))
         self._invalidate_alignment()
         self._select(side, len(panel.points) - 1)
+        self._mark_dirty()
 
     def on_grab(self, side: Side, idx: int) -> None:
         if self._warn_locked("move points"):
@@ -840,6 +875,7 @@ class App:
             return
         self._invalidate_alignment()
         self._select(side, idx)
+        self._mark_dirty()
 
     def on_resize_point(self, side: Side, idx: int, r: int) -> None:
         if self._is_aligned():
@@ -859,6 +895,7 @@ class App:
             self.radius.set(r)
             self._suppress_radius = False
         self._update_status()
+        self._mark_dirty()
 
     # ------------------------------------------------------- pad callbacks
 
@@ -880,6 +917,7 @@ class App:
         self.overlay.pads.append(pad)
         self._set_selected_pad(len(self.overlay.pads) - 1)
         self.status.config(text=f"Placed pad on {side.upper()} side — press E to edit.")
+        self._mark_dirty()
 
     def on_grab_pad(self, idx: int) -> None:
         self._set_selected_pad(idx)
@@ -892,12 +930,14 @@ class App:
         pad = self.overlay.pads[idx]
         pad.x = int(round(tx)); pad.y = int(round(ty))
         self._draw_pad_views()
+        self._mark_dirty()
 
     def on_resize_pad(self, idx: int, r: int) -> None:
         if idx >= len(self.overlay.pads):
             return
         self._set_last_pad_radius(r)
         self._draw_pad_views()
+        self._mark_dirty()
 
     def _set_last_pad_radius(self, r: int) -> None:
         self._last_pad_radius = r
@@ -930,6 +970,7 @@ class App:
         self.overlay.regions.append(region)
         self._set_selected_region(len(self.overlay.regions) - 1)
         self.status.config(text=f"Placed region on {side.upper()} side — press E to edit.")
+        self._mark_dirty()
 
     def on_grab_region(self, idx: int) -> None:
         self._set_selected_region(idx)
@@ -943,6 +984,7 @@ class App:
         region = self.overlay.regions[idx]
         region.x = int(round(tx)); region.y = int(round(ty))
         self._draw_pad_views()
+        self._mark_dirty()
 
     def on_resize_region(self, idx: int, tx: float, ty: float,
                          w: float, h: float) -> None:
@@ -950,6 +992,7 @@ class App:
             return
         # The view already updated x/y/w/h live; this fires once on release.
         self._draw_pad_views()
+        self._mark_dirty()
 
     def on_region_deselect(self) -> None:
         self._set_selected_region(None)
@@ -1040,21 +1083,25 @@ class App:
             pad.color = result[1]
             color_swatch.config(bg=pad.color, activebackground=pad.color)
             self._draw_pad_views()
+            self._mark_dirty()
         color_swatch.config(command=pick_color)
 
         def commit_name(*_):
             pad.name = name_var.get()
             self._update_shortcut_bar()
             self._draw_pad_views()
+            self._mark_dirty()
 
         def commit_description(_=None):
             pad.description = desc_text.get("1.0", "end-1c")
             desc_text.edit_modified(False)
+            self._mark_dirty()
 
         def commit_opacity(*_):
             pad.opacity = float(op_var.get())
             self._last_pad_opacity = pad.opacity
             self._draw_pad_views()
+            self._mark_dirty()
 
         def commit_size(*_):
             r = max(RADIUS_MIN, min(RADIUS_MAX, int(round(size_var.get()))))
@@ -1063,6 +1110,7 @@ class App:
                 pad.r = r
                 self._set_last_pad_radius(r)
                 self._draw_pad_views()
+                self._mark_dirty()
 
         def delete_pad():
             if pad in self.overlay.pads:
@@ -1070,6 +1118,7 @@ class App:
             self.overlay.selected_pad = None
             self._update_shortcut_bar()
             self._draw_pad_views()
+            self._mark_dirty()
             win.destroy()
 
         def remember_geometry(_=None):
@@ -1164,21 +1213,25 @@ class App:
             region.color = result[1]
             color_swatch.config(bg=region.color, activebackground=region.color)
             self._draw_pad_views()
+            self._mark_dirty()
         color_swatch.config(command=pick_color)
 
         def commit_name(*_):
             region.name = name_var.get()
             self._update_shortcut_bar()
             self._draw_pad_views()
+            self._mark_dirty()
 
         def commit_description(_=None):
             region.description = desc_text.get("1.0", "end-1c")
             desc_text.edit_modified(False)
+            self._mark_dirty()
 
         def commit_opacity(*_):
             region.opacity = float(op_var.get())
             self._last_region_opacity = region.opacity
             self._draw_pad_views()
+            self._mark_dirty()
 
         def commit_w(*_):
             v = max(REGION_MIN, min(REGION_MAX, int(round(w_var.get()))))
@@ -1186,6 +1239,7 @@ class App:
             if region.w != v:
                 region.w = v
                 self._draw_pad_views()
+                self._mark_dirty()
 
         def commit_h(*_):
             v = max(REGION_MIN, min(REGION_MAX, int(round(h_var.get()))))
@@ -1193,6 +1247,7 @@ class App:
             if region.h != v:
                 region.h = v
                 self._draw_pad_views()
+                self._mark_dirty()
 
         def delete_region():
             if region in self.overlay.regions:
@@ -1201,6 +1256,7 @@ class App:
                 v.selected_region = None
             self._update_shortcut_bar()
             self._draw_pad_views()
+            self._mark_dirty()
             win.destroy()
 
         def remember_geometry(_=None):
@@ -1272,12 +1328,15 @@ class App:
     def clear_points(self) -> None:
         if self._warn_locked("clear points"):
             return
+        if not (self.panel_top.points or self.panel_bottom.points):
+            return
         self.panel_top.points.clear()
         self.panel_bottom.points.clear()
         self._select(None, None)
         self._invalidate_alignment()
         self.panel_top.draw(); self.panel_bottom.draw()
         self._update_status()
+        self._mark_dirty()
 
     # ------------------------------------------------------------- alignment
 
@@ -1344,6 +1403,7 @@ class App:
         self._refresh_mode_bars()
         self._update_status()
         self.status.config(text="Alignment reset — adjust points and click Align.")
+        self._mark_dirty()
 
     def _confirm_reset_with_pads(self) -> bool:
         win = tk.Toplevel(self.root)
@@ -1408,6 +1468,9 @@ class App:
     def on_opacity_change(self) -> None:
         for v in self._pad_views():
             v.set_alpha(self.opacity.get())
+        # Opacity is part of the saved view state, so any change is a project edit.
+        if self.top_path is not None:
+            self._mark_dirty()
 
     def rotate_overlay(self) -> None:
         if self.warped_bottom is None:
@@ -1415,6 +1478,7 @@ class App:
             return
         for v in self._pad_views():
             v.rotate_cw()
+        self._mark_dirty()
 
     def flip_overlay(self) -> None:
         if self.warped_bottom is None:
@@ -1422,6 +1486,7 @@ class App:
             return
         for v in self._pad_views():
             v.toggle_flip()
+        self._mark_dirty()
 
     def fit_views(self) -> None:
         if not self._is_aligned():
