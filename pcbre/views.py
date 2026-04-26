@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps, ImageTk
 
 from .imageops import BILINEAR, ROTATE_90, ROTATE_180, ROTATE_270
-from .model import Pad, Point, Side, hex_to_rgb, random_pad_color
+from .model import Pad, Point, Region, Side, hex_to_rgb, random_pad_color
 
 PANEL_W, PANEL_H = 640, 720
 OVERLAY_W, OVERLAY_H = 1300, 760
@@ -18,6 +18,8 @@ MIN_ZOOM = 0.05
 MAX_ZOOM = 80.0
 RADIUS_MIN = 2
 RADIUS_MAX = 120
+REGION_MIN = 4   # min width/height (top-image px) for a region to be committed
+REGION_MAX = 8000
 
 POINT_COLORS = [
     "#ff3b30", "#34c759", "#0a84ff", "#ff9f0a", "#bf5af2",
@@ -178,6 +180,9 @@ def _wheel_sign(e) -> int:
 class LongPress:
     DURATION_MS = 250
     FRAMES = 5
+    START_R = 6.0
+    DEFAULT_TARGET_R = 24.0
+    MIN_TARGET_R = 8.0
 
     def __init__(self, canvas: tk.Canvas) -> None:
         self.canvas = canvas
@@ -188,14 +193,19 @@ class LongPress:
         self._cy = 0
         self._step = 0
         self._tick_id: str | None = None
+        self._target_r = self.DEFAULT_TARGET_R
 
-    def start(self, cx: int, cy: int, color: str = "#ffffff") -> None:
+    def start(self, cx: int, cy: int, color: str = "#ffffff",
+              target_r: float | None = None) -> None:
         self.cancel()
         self.active = True
         self.ready = False
         self.color = color
         self._cx, self._cy = cx, cy
         self._step = 0
+        self._target_r = max(self.MIN_TARGET_R,
+                             float(target_r) if target_r is not None
+                             else self.DEFAULT_TARGET_R)
         self._tick()
 
     def cancel(self) -> None:
@@ -217,7 +227,7 @@ class LongPress:
             return
         ready = self._step >= self.FRAMES
         progress = 1.0 if ready else self._step / self.FRAMES
-        r = 6 + progress * 18
+        r = self.START_R + progress * (self._target_r - self.START_R)
         self.canvas.delete("lp_ring")
         self.canvas.create_oval(
             self._cx - r, self._cy - r, self._cx + r, self._cy + r,
@@ -463,6 +473,7 @@ class Tooltip:
 
 class OverlayView(ImageView):
     CLICK_THRESHOLD = 3
+    HANDLE_R = 5  # screen-px radius of the resize dots on a selected region
 
     def __init__(self, parent: tk.Widget,
                  on_place_pad:        Callable[[float, float, Side, str], None] | None = None,
@@ -472,6 +483,12 @@ class OverlayView(ImageView):
                  on_resize_pad:       Callable[[int, int], None] | None = None,
                  on_pad_deselect:     Callable[[], None] | None = None,
                  on_double_click_pad: Callable[[int], None] | None = None,
+                 on_place_region:        Callable[[float, float, float, float, Side, str], None] | None = None,
+                 on_grab_region:         Callable[[int], None] | None = None,
+                 on_move_region:         Callable[[int, float, float], None] | None = None,
+                 on_resize_region:       Callable[[int, float, float, float, float], None] | None = None,
+                 on_region_deselect:     Callable[[], None] | None = None,
+                 on_double_click_region: Callable[[int], None] | None = None,
                  single_source: str | None = None) -> None:
         super().__init__(parent, OVERLAY_W, OVERLAY_H, cursor="crosshair")
         self.top: Image.Image | None = None
@@ -482,6 +499,7 @@ class OverlayView(ImageView):
         self.rotation = 0
         self.flipped = False
         self.single_source = single_source  # None | "top" | "warped"
+        self.tool_mode: str = "pad"  # "pad" | "region"
 
         # Pads live in TOP-image coordinates so they survive view rotation/flip.
         self.pads: list[Pad] = []
@@ -494,8 +512,31 @@ class OverlayView(ImageView):
         self.on_pad_deselect = on_pad_deselect or (lambda: None)
         self.on_double_click_pad = on_double_click_pad or (lambda i: None)
 
+        # Regions: same TOP-coord storage; rectangles stay axis-aligned through
+        # the 90°/flip view transforms used here.
+        self.regions: list[Region] = []
+        self.selected_region: int | None = None
+        # Top-image radius used by the long-press preview ring so the growing
+        # ring lands at the same on-screen size as the pad about to be dropped.
+        self.next_pad_radius: int = 12
+        self.on_place_region = on_place_region or (lambda x, y, w, h, s, c: None)
+        self.on_grab_region = on_grab_region or (lambda i: None)
+        self.on_move_region = on_move_region or (lambda i, x, y: None)
+        self.on_resize_region = on_resize_region or (lambda i, x, y, w, h: None)
+        self.on_region_deselect = on_region_deselect or (lambda: None)
+        self.on_double_click_region = on_double_click_region or (lambda i: None)
+
         self._press_view: tuple[float, float] | None = None
         self._drag_pad: int | None = None
+        self._drag_region: int | None = None
+        self._region_resize_idx: int | None = None
+        self._region_resize_handle: str | None = None
+        # View-coord rect at the start of a resize, so we can update by deltas.
+        self._region_resize_start_rect: tuple[float, float, float, float] | None = None
+        # In-progress region creation, both endpoints in view coords.
+        self._region_create_start: tuple[float, float] | None = None
+        self._region_create_end: tuple[float, float] | None = None
+        self._pending_region_color = "#0a84ff"
         self._click_moved = False
         self._tooltip = Tooltip(self.canvas)
         self._hover_idx: int | None = None
@@ -509,6 +550,9 @@ class OverlayView(ImageView):
         c.bind("<Double-Button-1>", self._on_double_click)
         c.bind("<Motion>",          self._on_hover)
         c.bind("<Leave>",           lambda e: self._on_leave())
+        c.bind("<Alt-ButtonPress-1>", self._on_alt_press)
+        for ev in ("<Alt-MouseWheel>", "<Alt-Button-4>", "<Alt-Button-5>"):
+            c.bind(ev, self._on_alt_wheel)
         for ev in ("<ButtonPress-2>", "<ButtonPress-3>", "<Shift-ButtonPress-1>"):
             c.bind(ev, self._pan_start)
         for ev in ("<B2-Motion>", "<B3-Motion>", "<Shift-B1-Motion>"):
@@ -519,12 +563,20 @@ class OverlayView(ImageView):
             self.fit()
             return
         vx, vy = self.canvas_to_orig(e.x, e.y)
-        hit = self._hit_pad(vx, vy)
-        if hit is not None:
+        pad_hit = self._hit_pad(vx, vy)
+        if pad_hit is not None:
             self._tooltip.hide(self.schedule_draw)
-            self.on_double_click_pad(hit)
+            self.on_double_click_pad(pad_hit)
+            return
+        region_hit = self._hit_region_body(vx, vy)
+        if region_hit is not None:
+            self._tooltip.hide(self.schedule_draw)
+            self.on_double_click_region(region_hit)
             return
         self.fit()
+
+    def set_tool_mode(self, mode: str) -> None:
+        self.tool_mode = "region" if mode == "region" else "pad"
 
     # -- view content --------------------------------------------------------
 
@@ -547,6 +599,39 @@ class OverlayView(ImageView):
         if self.single_source == "warped":
             return "bottom"
         return "bottom" if self.alpha > 0.5 else "top"
+
+    def _side_visibility(self, side: Side) -> float:
+        """0..1 visibility factor for a pad/region on `side` in this view.
+
+        Single-source views show only their own side. Single-image projects
+        (where top and warped reference the same image) skip the fade entirely.
+        Otherwise we ramp the layer's effective opacity 0.5 → 0.6 (hidden →
+        shown) so the slider can keep one side, the other, or neither.
+        """
+        if self.single_source == "top":
+            return 1.0 if side == "top" else 0.0
+        if self.single_source == "warped":
+            return 1.0 if side == "bottom" else 0.0
+        if self.top is not None and self.top is self.warped:
+            return 1.0
+        layer_op = self.alpha if side == "bottom" else (1.0 - self.alpha)
+        if layer_op <= 0.5:
+            return 0.0
+        if layer_op >= 0.6:
+            return 1.0
+        return (layer_op - 0.5) / 0.1
+
+    @staticmethod
+    def _fade_color(hex_color: str, factor: float) -> str:
+        """Blend `hex_color` toward the canvas bg by `factor` (1 = original)."""
+        if factor >= 0.999:
+            return hex_color
+        r, g, b = hex_to_rgb(hex_color)
+        bg_r, bg_g, bg_b = 0x1c, 0x1c, 0x1e
+        nr = int(round(bg_r + (r - bg_r) * factor))
+        ng = int(round(bg_g + (g - bg_g) * factor))
+        nb = int(round(bg_b + (b - bg_b) * factor))
+        return f"#{nr:02x}{ng:02x}{nb:02x}"
 
     def set_pair(self, top: Image.Image | None,
                  warped: Image.Image | None) -> None:
@@ -625,6 +710,65 @@ class OverlayView(ImageView):
             x = (W - 1) - x
         return x, y
 
+    # -- region geometry -----------------------------------------------------
+
+    def _region_view_rect(self, r: Region) -> tuple[float, float, float, float]:
+        """Region's axis-aligned bounding box in *view* coords (vx0, vy0, vx1, vy1)."""
+        half_w = r.w / 2.0
+        half_h = r.h / 2.0
+        corners = (
+            (r.x - half_w, r.y - half_h), (r.x + half_w, r.y - half_h),
+            (r.x + half_w, r.y + half_h), (r.x - half_w, r.y + half_h),
+        )
+        vxs = []
+        vys = []
+        for tx, ty in corners:
+            vx, vy = self.top_to_view(tx, ty)
+            vxs.append(vx)
+            vys.append(vy)
+        return min(vxs), min(vys), max(vxs), max(vys)
+
+    def _view_rect_to_top_rect(self, vx0: float, vy0: float,
+                                vx1: float, vy1: float) -> tuple[float, float, float, float]:
+        """Inverse of `_region_view_rect`. Returns (cx, cy, w, h) in top coords."""
+        corners = (
+            self.view_to_top(vx0, vy0), self.view_to_top(vx1, vy0),
+            self.view_to_top(vx1, vy1), self.view_to_top(vx0, vy1),
+        )
+        txs = [c[0] for c in corners]
+        tys = [c[1] for c in corners]
+        tx0, tx1 = min(txs), max(txs)
+        ty0, ty1 = min(tys), max(tys)
+        return (tx0 + tx1) / 2.0, (ty0 + ty1) / 2.0, tx1 - tx0, ty1 - ty0
+
+    def _hit_region_body(self, vx: float, vy: float) -> int | None:
+        for i in range(len(self.regions) - 1, -1, -1):
+            reg = self.regions[i]
+            if self._side_visibility(reg.side) <= 0.0:
+                continue
+            rx0, ry0, rx1, ry1 = self._region_view_rect(reg)
+            if rx0 <= vx <= rx1 and ry0 <= vy <= ry1:
+                return i
+        return None
+
+    def _region_handle_at(self, vx: float, vy: float) -> str | None:
+        idx = self.selected_region
+        if idx is None or idx >= len(self.regions):
+            return None
+        rx0, ry0, rx1, ry1 = self._region_view_rect(self.regions[idx])
+        cxv = (rx0 + rx1) / 2.0
+        cyv = (ry0 + ry1) / 2.0
+        slop = (self.HANDLE_R + 4) / max(self.zoom, 1e-6)
+        handles = (
+            ("nw", rx0, ry0), ("n", cxv, ry0), ("ne", rx1, ry0),
+            ("w",  rx0, cyv),                  ("e",  rx1, cyv),
+            ("sw", rx0, ry1), ("s", cxv, ry1), ("se", rx1, ry1),
+        )
+        for name, hx, hy in handles:
+            if abs(vx - hx) <= slop and abs(vy - hy) <= slop:
+                return name
+        return None
+
     # -- input ---------------------------------------------------------------
 
     def _hit_pad(self, vx: float, vy: float) -> int | None:
@@ -633,6 +777,8 @@ class OverlayView(ImageView):
         slop = 4.0 / max(self.zoom, 1e-6)
         for i in range(len(self.pads) - 1, -1, -1):
             p = self.pads[i]
+            if self._side_visibility(p.side) <= 0.0:
+                continue
             pvx, pvy = self.top_to_view(p.x, p.y)
             if np.hypot(vx - pvx, vy - pvy) <= p.r + slop:
                 return i
@@ -642,25 +788,105 @@ class OverlayView(ImageView):
         if self._content_size() is None:
             return
         vx, vy = self.canvas_to_orig(e.x, e.y)
-        hit = self._hit_pad(vx, vy)
         self._click_moved = False
         self._tooltip.hide(self.schedule_draw)
-        if hit is not None:
-            self._drag_pad = hit
+
+        # Resize takes priority over body/pad hits when a region is already
+        # selected — the dots are only there for the selected region anyway.
+        if self.selected_region is not None:
+            handle = self._region_handle_at(vx, vy)
+            if handle is not None:
+                self._region_resize_idx = self.selected_region
+                self._region_resize_handle = handle
+                self._region_resize_start_rect = self._region_view_rect(
+                    self.regions[self.selected_region])
+                self._press_view = (vx, vy)
+                return
+
+        pad_hit = self._hit_pad(vx, vy)
+        if pad_hit is not None:
+            self._drag_pad = pad_hit
             self._press_view = None
-            self.on_grab_pad(hit)
-        else:
-            self._drag_pad = None
+            if self.selected_region is not None:
+                self.selected_region = None
+                self.on_region_deselect()
+            self.on_grab_pad(pad_hit)
+            return
+
+        region_hit = self._hit_region_body(vx, vy)
+        if region_hit is not None:
+            self._drag_region = region_hit
+            self._press_view = (vx, vy)
+            self._region_drag_press_top = self.view_to_top(vx, vy)
+            self._region_drag_orig_xy = (
+                self.regions[region_hit].x, self.regions[region_hit].y)
             if self.selected_pad is not None:
                 self.selected_pad = None
                 self.on_pad_deselect()
-            self._press_view = (vx, vy)
-            self._pan_anchor = (e.x, e.y, self.ox, self.oy)
-            self._pending_pad_color = random_pad_color()
-            self._long_press.start(e.x, e.y, color=self._pending_pad_color)
+            self.on_grab_region(region_hit)
+            return
+
+        # Empty space: drop any prior selection.
+        if self.selected_pad is not None:
+            self.selected_pad = None
+            self.on_pad_deselect()
+        if self.selected_region is not None:
+            self.selected_region = None
+            self.on_region_deselect()
+
+        if self.tool_mode == "region":
+            self._region_create_start = (vx, vy)
+            self._region_create_end = (vx, vy)
+            self._pending_region_color = random_pad_color()
+            self.schedule_draw()
+            return
+
+        # Pad mode default: arm long-press for placement, allow pan on motion.
+        self._press_view = (vx, vy)
+        self._pan_anchor = (e.x, e.y, self.ox, self.oy)
+        self._pending_pad_color = random_pad_color()
+        target_r = self.next_pad_radius * self.zoom
+        self._long_press.start(e.x, e.y, color=self._pending_pad_color,
+                               target_r=target_r)
+
+    def _on_alt_press(self, e) -> None:
+        """Alt+click on a selected region's edge dot starts a resize."""
+        if self._content_size() is None:
+            return
+        vx, vy = self.canvas_to_orig(e.x, e.y)
+        handle = self._region_handle_at(vx, vy)
+        if handle is None or self.selected_region is None:
+            # Nothing to do for Alt+click elsewhere — fall through to normal press.
+            self._on_press(e)
+            return
+        self._tooltip.hide(self.schedule_draw)
+        self._click_moved = False
+        self._region_resize_idx = self.selected_region
+        self._region_resize_handle = handle
+        self._region_resize_start_rect = self._region_view_rect(
+            self.regions[self.selected_region])
+        self._press_view = (vx, vy)
 
     def _on_motion(self, e) -> None:
         if self._content_size() is None:
+            return
+        if self._region_resize_handle is not None:
+            self._update_region_resize(e)
+            return
+        if self._drag_region is not None:
+            self._click_moved = True
+            vx, vy = self.canvas_to_orig(e.x, e.y)
+            tx, ty = self.view_to_top(vx, vy)
+            dx = tx - self._region_drag_press_top[0]
+            dy = ty - self._region_drag_press_top[1]
+            new_x = self._region_drag_orig_xy[0] + dx
+            new_y = self._region_drag_orig_xy[1] + dy
+            self.on_move_region(self._drag_region, new_x, new_y)
+            return
+        if self._region_create_start is not None:
+            self._click_moved = True
+            self._region_create_end = self.canvas_to_orig(e.x, e.y)
+            self.schedule_draw()
             return
         if self._drag_pad is not None:
             self._click_moved = True
@@ -679,6 +905,40 @@ class OverlayView(ImageView):
         self._pan_drag(e)
 
     def _on_release(self, e) -> None:
+        # Region resize: notify app once at end so any clamping/bookkeeping fires.
+        if self._region_resize_handle is not None:
+            idx = self._region_resize_idx
+            if idx is not None and idx < len(self.regions):
+                r = self.regions[idx]
+                self.on_resize_region(idx, r.x, r.y, r.w, r.h)
+            self._region_resize_handle = None
+            self._region_resize_idx = None
+            self._region_resize_start_rect = None
+            self._press_view = None
+            return
+
+        # Region drag: moves were applied live; nothing extra to commit here.
+        if self._drag_region is not None:
+            self._drag_region = None
+            self._press_view = None
+            return
+
+        # Region creation: commit if the rectangle is big enough.
+        if self._region_create_start is not None:
+            s = self._region_create_start
+            ed = self._region_create_end or s
+            self._region_create_start = None
+            self._region_create_end = None
+            cx, cy, w, h = self._view_rect_to_top_rect(
+                min(s[0], ed[0]), min(s[1], ed[1]),
+                max(s[0], ed[0]), max(s[1], ed[1]))
+            if w >= REGION_MIN and h >= REGION_MIN:
+                self.on_place_region(cx, cy, w, h, self._detect_side(),
+                                     self._pending_region_color)
+            self.schedule_draw()
+            return
+
+        # Pad: long-press placement OR drop after drag.
         place_args = None
         if (self._long_press.ready
                 and self._press_view is not None and self._drag_pad is None):
@@ -695,21 +955,52 @@ class OverlayView(ImageView):
         self._press_view = None
         self._pan_anchor = None
 
-    def _on_wheel(self, e) -> None:
-        # Hold a pad + scroll → resize that pad instead of zooming.
-        if self._drag_pad is not None and self._drag_pad < len(self.pads):
-            sign = _wheel_sign(e)
-            if sign == 0:
-                return
-            pad = self.pads[self._drag_pad]
-            step = max(1, pad.r // 10)
-            new_r = max(RADIUS_MIN, min(RADIUS_MAX, pad.r + sign * step))
-            if new_r != pad.r:
-                pad.r = new_r
-                self.on_resize_pad(self._drag_pad, new_r)
-                self.schedule_draw()
+    def _update_region_resize(self, e) -> None:
+        idx = self._region_resize_idx
+        if (idx is None or self._region_resize_handle is None
+                or self._region_resize_start_rect is None
+                or idx >= len(self.regions)):
             return
+        rx0, ry0, rx1, ry1 = self._region_resize_start_rect
+        vx, vy = self.canvas_to_orig(e.x, e.y)
+        h = self._region_resize_handle
+        if "n" in h: ry0 = vy
+        if "s" in h: ry1 = vy
+        if "w" in h: rx0 = vx
+        if "e" in h: rx1 = vx
+        rx0, rx1 = sorted((rx0, rx1))
+        ry0, ry1 = sorted((ry0, ry1))
+        cx, cy, tw, th = self._view_rect_to_top_rect(rx0, ry0, rx1, ry1)
+        region = self.regions[idx]
+        region.x = int(round(cx))
+        region.y = int(round(cy))
+        region.w = max(REGION_MIN, min(REGION_MAX, int(round(tw))))
+        region.h = max(REGION_MIN, min(REGION_MAX, int(round(th))))
+        self.schedule_draw()
+
+    def _on_wheel(self, e) -> None:
+        # Pads no longer use drag+scroll; plain wheel always zooms.
         super()._on_wheel(e)
+
+    def _on_alt_wheel(self, e) -> None:
+        """Alt+scroll resizes the pad under the cursor (else falls back to zoom)."""
+        if self._content_size() is None:
+            return
+        vx, vy = self.canvas_to_orig(e.x, e.y)
+        pad_idx = self._hit_pad(vx, vy)
+        if pad_idx is None:
+            super()._on_wheel(e)
+            return
+        sign = _wheel_sign(e)
+        if sign == 0:
+            return
+        pad = self.pads[pad_idx]
+        step = max(1, pad.r // 10)
+        new_r = max(RADIUS_MIN, min(RADIUS_MAX, pad.r + sign * step))
+        if new_r != pad.r:
+            pad.r = new_r
+            self.on_resize_pad(pad_idx, new_r)
+            self.schedule_draw()
 
     # -- hover ---------------------------------------------------------------
 
@@ -717,21 +1008,43 @@ class OverlayView(ImageView):
         if self._content_size() is None:
             self._tooltip.hide(self.schedule_draw); self._hover_idx = None
             return
-        if (e.state & _BUTTON_MASK) or self._drag_pad is not None or self._pan_anchor is not None:
+        gesturing = (
+            (e.state & _BUTTON_MASK)
+            or self._drag_pad is not None
+            or self._drag_region is not None
+            or self._region_resize_handle is not None
+            or self._region_create_start is not None
+            or self._pan_anchor is not None
+        )
+        if gesturing:
             self._tooltip.hide(self.schedule_draw); self._hover_idx = None
             return
         vx, vy = self.canvas_to_orig(e.x, e.y)
-        hit = self._hit_pad(vx, vy)
-        if hit == self._hover_idx:
+        pad_hit = self._hit_pad(vx, vy)
+        if pad_hit is not None:
+            key = ("p", pad_hit)
+            if key == self._hover_idx:
+                return
+            self._hover_idx = key
+            pad = self.pads[pad_hit]
+            title = pad.name or f"Pad #{pad_hit + 1}"
+            text = f"{title}\n{pad.description}" if pad.description else title
+            self._tooltip.schedule(e.x, e.y, text, on_show=self.schedule_draw)
             return
-        self._hover_idx = hit
-        if hit is None:
+        region_hit = self._hit_region_body(vx, vy)
+        if region_hit is not None:
+            key = ("r", region_hit)
+            if key == self._hover_idx:
+                return
+            self._hover_idx = key
+            reg = self.regions[region_hit]
+            title = reg.name or f"Region #{region_hit + 1}"
+            text = f"{title}\n{reg.description}" if reg.description else title
+            self._tooltip.schedule(e.x, e.y, text, on_show=self.schedule_draw)
+            return
+        if self._hover_idx is not None:
             self._tooltip.hide(self.schedule_draw)
-            return
-        pad = self.pads[hit]
-        title = pad.name or f"Pad #{hit + 1}"
-        text = f"{title}\n{pad.description}" if pad.description else title
-        self._tooltip.schedule(e.x, e.y, text, on_show=self.schedule_draw)
+            self._hover_idx = None
 
     def _on_leave(self) -> None:
         self._tooltip.hide(self.schedule_draw)
@@ -762,50 +1075,126 @@ class OverlayView(ImageView):
             blend = src.crop((ix0, iy0, ix1, iy1))
             if (new_w, new_h) != blend.size:
                 blend = blend.resize((new_w, new_h), BILINEAR)
-        if self.pads:
-            blend = self._composite_pad_fills(blend, ix0, iy0, new_w, new_h)
+        if self.pads or self.regions:
+            blend = self._composite_overlays(blend, ix0, iy0, new_w, new_h)
         self._photo = ImageTk.PhotoImage(blend)
         cx0 = (ix0 - self.ox) * self.zoom
         cy0 = (iy0 - self.oy) * self.zoom
         self.canvas.create_image(cx0, cy0, anchor="nw", image=self._photo)
 
-    def _composite_pad_fills(self, blend: Image.Image,
-                             ix0: int, iy0: int,
-                             new_w: int, new_h: int) -> Image.Image:
+    def _composite_overlays(self, blend: Image.Image,
+                            ix0: int, iy0: int,
+                            new_w: int, new_h: int) -> Image.Image:
         layer: Image.Image | None = None
         draw: ImageDraw.ImageDraw | None = None
+
+        def ensure_layer():
+            nonlocal layer, draw
+            if layer is None:
+                layer = Image.new("RGBA", (new_w, new_h), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(layer)
+            return draw
+
+        # Regions first so pads paint on top.
+        for reg in self.regions:
+            vis = self._side_visibility(reg.side)
+            if vis <= 0.0:
+                continue
+            rx0, ry0, rx1, ry1 = self._region_view_rect(reg)
+            cx0 = (rx0 - ix0) * self.zoom
+            cy0 = (ry0 - iy0) * self.zoom
+            cx1 = (rx1 - ix0) * self.zoom
+            cy1 = (ry1 - iy0) * self.zoom
+            if cx1 < 0 or cy1 < 0 or cx0 > new_w or cy0 > new_h:
+                continue
+            a = int(round(max(0.0, min(1.0, reg.opacity * vis)) * 255))
+            ensure_layer().rectangle(
+                [cx0, cy0, cx1, cy1],
+                fill=hex_to_rgb(reg.color) + (a,))
+
         for p in self.pads:
+            vis = self._side_visibility(p.side)
+            if vis <= 0.0:
+                continue
             vx, vy = self.top_to_view(p.x, p.y)
             cx = (vx - ix0) * self.zoom
             cy = (vy - iy0) * self.zoom
             r = p.r * self.zoom
             if cx + r < 0 or cy + r < 0 or cx - r > new_w or cy - r > new_h:
                 continue
-            if layer is None:
-                layer = Image.new("RGBA", (new_w, new_h), (0, 0, 0, 0))
-                draw = ImageDraw.Draw(layer)
-            a = int(round(max(0.0, min(1.0, p.opacity)) * 255))
-            draw.ellipse([cx - r, cy - r, cx + r, cy + r],
-                         fill=hex_to_rgb(p.color) + (a,))
+            a = int(round(max(0.0, min(1.0, p.opacity * vis)) * 255))
+            ensure_layer().ellipse(
+                [cx - r, cy - r, cx + r, cy + r],
+                fill=hex_to_rgb(p.color) + (a,))
+
         if layer is None:
             return blend
         return Image.alpha_composite(blend.convert("RGBA"), layer).convert("RGB")
 
     def _draw_overlays(self) -> None:
         c = self.canvas
+
+        # Regions (drawn under pads so a pad on top of a region stays readable).
+        for i, reg in enumerate(self.regions):
+            vis = self._side_visibility(reg.side)
+            if vis < 0.05:
+                continue
+            color = self._fade_color(reg.color, vis)
+            rx0, ry0, rx1, ry1 = self._region_view_rect(reg)
+            X0 = (rx0 - self.ox) * self.zoom
+            Y0 = (ry0 - self.oy) * self.zoom
+            X1 = (rx1 - self.ox) * self.zoom
+            Y1 = (ry1 - self.oy) * self.zoom
+            is_sel = i == self.selected_region
+            c.create_rectangle(X0, Y0, X1, Y1, outline=color,
+                               width=3 if is_sel else 2)
+            if is_sel:
+                halo = self._fade_color("#ffffff", vis)
+                c.create_rectangle(X0 - 4, Y0 - 4, X1 + 4, Y1 + 4,
+                                   outline=halo, width=1)
+                mx = (X0 + X1) / 2.0
+                my = (Y0 + Y1) / 2.0
+                hr = self.HANDLE_R
+                for hx, hy in (
+                    (X0, Y0), (mx, Y0), (X1, Y0),
+                    (X0, my),           (X1, my),
+                    (X0, Y1), (mx, Y1), (X1, Y1),
+                ):
+                    c.create_oval(hx - hr, hy - hr, hx + hr, hy + hr,
+                                  fill=halo, outline=color, width=2)
+            label = reg.name or f"R{i + 1}"
+            c.create_text(X1 + 6, Y0, text=label, fill=color, anchor="nw",
+                          font=("TkDefaultFont", 10, "bold"))
+
+        # In-progress region creation: dashed preview.
+        if self._region_create_start is not None and self._region_create_end is not None:
+            sx, sy = self._region_create_start
+            ex, ey = self._region_create_end
+            X0 = (min(sx, ex) - self.ox) * self.zoom
+            Y0 = (min(sy, ey) - self.oy) * self.zoom
+            X1 = (max(sx, ex) - self.ox) * self.zoom
+            Y1 = (max(sy, ey) - self.oy) * self.zoom
+            c.create_rectangle(X0, Y0, X1, Y1, outline=self._pending_region_color,
+                               width=2, dash=(4, 3))
+
         for i, p in enumerate(self.pads):
+            vis = self._side_visibility(p.side)
+            if vis < 0.05:
+                continue
+            color = self._fade_color(p.color, vis)
             vx, vy = self.top_to_view(p.x, p.y)
             X = (vx - self.ox) * self.zoom
             Y = (vy - self.oy) * self.zoom
             R = max(3.0, p.r * self.zoom)
             c.create_oval(X - R, Y - R, X + R, Y + R,
-                          outline=p.color, width=3 if i == self.selected_pad else 2)
+                          outline=color, width=3 if i == self.selected_pad else 2)
             if i == self.selected_pad:
+                halo = self._fade_color("#ffffff", vis)
                 c.create_oval(X - R - 4, Y - R - 4, X + R + 4, Y + R + 4,
-                              outline="white", width=1)
-                c.create_line(X - R - 6, Y, X + R + 6, Y, fill="white")
-                c.create_line(X, Y - R - 6, X, Y + R + 6, fill="white")
+                              outline=halo, width=1)
+                c.create_line(X - R - 6, Y, X + R + 6, Y, fill=halo)
+                c.create_line(X, Y - R - 6, X, Y + R + 6, fill=halo)
             label = p.name or f"#{i + 1}"
-            c.create_text(X + R + 6, Y, text=label, fill=p.color, anchor="w",
+            c.create_text(X + R + 6, Y, text=label, fill=color, anchor="w",
                           font=("TkDefaultFont", 10, "bold"))
         self._tooltip.draw_into()

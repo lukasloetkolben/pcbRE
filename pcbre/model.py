@@ -9,7 +9,7 @@ from typing import Literal
 
 Side = Literal["top", "bottom"]
 
-PROJECT_VERSION = 2
+PROJECT_VERSION = 3
 PROJECT_EXT = ".pcbre"
 
 
@@ -38,10 +38,27 @@ class Pad:
     side: Side = "top"
 
 
+@dataclass
+class Region:
+    """Axis-aligned rectangle in TOP-image coordinates. Same metadata as Pad."""
+    x: int  # center
+    y: int  # center
+    w: int = 80
+    h: int = 50
+    name: str = ""
+    description: str = ""
+    color: str = "#0a84ff"
+    opacity: float = 0.3
+    side: Side = "top"
+
+
 def random_pad_color() -> str:
     """Saturated random color, evenly distributed over hue."""
     r, g, b = colorsys.hsv_to_rgb(random.random(), 0.85, 0.95)
     return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
+
+
+random_region_color = random_pad_color
 
 
 def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
@@ -75,6 +92,7 @@ def normalize_project_data(data: dict) -> dict:
                 "bottom": list(align.get("bottom") or []),
             },
             "pads": list(data.get("pads") or []),
+            "regions": list(data.get("regions") or []),
         }
     else:  # legacy v1: flat keys, "bot_*" prefixes
         out = {
@@ -92,6 +110,7 @@ def normalize_project_data(data: dict) -> dict:
                 "bottom": list(data.get("bot_points") or []),
             },
             "pads": list(data.get("pads") or []),
+            "regions": [],
         }
     if out["view"]["rotation"] not in (0, 90, 180, 270):
         out["view"]["rotation"] = 0

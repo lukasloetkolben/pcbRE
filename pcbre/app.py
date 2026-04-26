@@ -18,6 +18,7 @@ from .model import (
     PROJECT_VERSION,
     Pad,
     Point,
+    Region,
     Side,
     normalize_project_data,
     normalize_side,
@@ -27,6 +28,8 @@ from .views import (
     Panel,
     RADIUS_MAX,
     RADIUS_MIN,
+    REGION_MAX,
+    REGION_MIN,
 )
 
 DEFAULT_RADIUS = 8
@@ -63,6 +66,8 @@ class App:
         self.radius = tk.DoubleVar(value=DEFAULT_RADIUS)
         # New projects open straight into overlay once alignment is in place.
         self.mode = tk.StringVar(value="overlay")
+        # Place tool: "pad" (long-press to drop) or "region" (drag to box).
+        self.tool_mode = tk.StringVar(value="pad")
 
         self.selected: tuple[Side, int] | None = None
         self._suppress_radius = False
@@ -70,6 +75,8 @@ class App:
         self._last_pad_radius = 12
         self._last_pad_opacity = 0.3
         self._pad_editor_geometry: str | None = None
+        self._last_region_opacity = 0.3
+        self._region_editor_geometry: str | None = None
 
         self._build_ui()
 
@@ -136,6 +143,15 @@ class App:
         ttk.Label(o, text="Opacity:").pack(side="left", padx=(0, 4))
         ttk.Scale(o, from_=0.0, to=1.0, variable=self.opacity, orient="horizontal",
                   length=200, command=lambda *_: self.on_opacity_change()).pack(side="left")
+        ttk.Separator(o, orient="vertical").pack(side="left", fill="y", padx=10)
+
+        ttk.Label(o, text="Place:").pack(side="left", padx=(0, 4))
+        for label, value in (("Pad", "pad"), ("Region", "region")):
+            ttk.Radiobutton(
+                o, text=label, value=value, variable=self.tool_mode,
+                style="Toolbutton",
+                command=self._on_tool_mode_change,
+            ).pack(side="left")
 
     def _build_status_area(self) -> None:
         self.status = ttk.Label(self.root, text="Load a top and bottom image to begin.")
@@ -185,7 +201,7 @@ class App:
         self.panel_top.pack(side="left", padx=4, fill="both", expand=True)
         self.panel_bottom.pack(side="left", padx=4, fill="both", expand=True)
 
-        pad_cb = dict(
+        cb = dict(
             on_place_pad=self.on_place_pad,
             on_grab_pad=self.on_grab_pad,
             on_move_pad=self.on_move_pad,
@@ -193,19 +209,29 @@ class App:
             on_resize_pad=self.on_resize_pad,
             on_pad_deselect=self.on_pad_deselect,
             on_double_click_pad=self._open_pad_editor,
+            on_place_region=self.on_place_region,
+            on_grab_region=self.on_grab_region,
+            on_move_region=self.on_move_region,
+            on_resize_region=self.on_resize_region,
+            on_region_deselect=self.on_region_deselect,
+            on_double_click_region=self._open_region_editor,
         )
-        self.overlay = OverlayView(self.canvas_frame, **pad_cb)
+        self.overlay = OverlayView(self.canvas_frame, **cb)
         # Side-by-side wrapper: grid with two uniform columns guarantees both
         # halves are always exactly (parent - margins) / 2 wide.
         self.sbs_frame = ttk.Frame(self.canvas_frame)
         self.sbs_frame.columnconfigure(0, weight=1, uniform="sbs")
         self.sbs_frame.columnconfigure(1, weight=1, uniform="sbs")
         self.sbs_frame.rowconfigure(0, weight=1)
-        self.overlay_left = OverlayView(self.sbs_frame, single_source="top", **pad_cb)
-        self.overlay_right = OverlayView(self.sbs_frame, single_source="warped", **pad_cb)
-        # All three views share the same pads list (mutate in place — never replace).
+        self.overlay_left = OverlayView(self.sbs_frame, single_source="top", **cb)
+        self.overlay_right = OverlayView(self.sbs_frame, single_source="warped", **cb)
+        # All three views share the same pads/regions lists (mutate in place — never replace).
         self.overlay_left.pads = self.overlay.pads
         self.overlay_right.pads = self.overlay.pads
+        self.overlay_left.regions = self.overlay.regions
+        self.overlay_right.regions = self.overlay.regions
+        self._set_last_pad_radius(self._last_pad_radius)
+        self._on_tool_mode_change()
 
     def _bind_keys(self) -> None:
         for seq, fn in [
@@ -230,8 +256,9 @@ class App:
                 self.op_bar.pack(fill="x")
             self.hint.config(text=(
                 "scroll = zoom · right/middle/Shift+drag = pan · "
-                "double-click = fit · hold ~0.3 s to drop a pad · "
-                "drag pad + scroll = resize · click empty = deselect"))
+                "double-click = fit · hold ~0.3 s = pad · "
+                "Region tool: drag a box · Alt+scroll on pad = resize · "
+                "drag a dot on the selected region to resize"))
             # Side-by-side view only makes sense with two images.
             if self.single_image_mode:
                 self.view_switcher.pack_forget()
@@ -302,6 +329,12 @@ class App:
             label = pad.name or f"#{self.overlay.selected_pad + 1}"
             self.shortcut_bar.config(
                 text=f'Selected pad: {label}   ·   "E" edit   ·   {_DELETE_KEY_HINT} delete')
+        elif self._is_aligned() and self.overlay.selected_region is not None:
+            reg = self.overlay.regions[self.overlay.selected_region]
+            label = reg.name or f"R{self.overlay.selected_region + 1}"
+            self.shortcut_bar.config(
+                text=(f'Selected region: {label}   ·   "E" edit   ·   '
+                      f"{_DELETE_KEY_HINT} delete   ·   drag dot to resize"))
         elif (not self._is_aligned()) and self.selected is not None:
             side, idx = self.selected
             self.shortcut_bar.config(
@@ -317,15 +350,22 @@ class App:
     def _on_e_key(self, e=None) -> None:
         if self._focused_in_text_input() or not self._is_aligned():
             return
-        idx = self.overlay.selected_pad
-        if idx is not None and idx < len(self.overlay.pads):
-            self._open_pad_editor(idx)
+        pad_idx = self.overlay.selected_pad
+        if pad_idx is not None and pad_idx < len(self.overlay.pads):
+            self._open_pad_editor(pad_idx)
+            return
+        reg_idx = self.overlay.selected_region
+        if reg_idx is not None and reg_idx < len(self.overlay.regions):
+            self._open_region_editor(reg_idx)
 
     def _on_delete_key(self, e=None) -> None:
         if self._focused_in_text_input():
             return
         if self._is_aligned() and self.overlay.selected_pad is not None:
             self._delete_selected_pad()
+            return
+        if self._is_aligned() and self.overlay.selected_region is not None:
+            self._delete_selected_region()
             return
         if (not self._is_aligned()) and self.selected is not None:
             self._delete_selected_point_pair()
@@ -336,6 +376,13 @@ class App:
             return
         del self.overlay.pads[idx]
         self._set_selected_pad(None)
+
+    def _delete_selected_region(self) -> None:
+        idx = self.overlay.selected_region
+        if idx is None or idx >= len(self.overlay.regions):
+            return
+        del self.overlay.regions[idx]
+        self._set_selected_region(None)
 
     def _delete_selected_point_pair(self) -> None:
         if self.selected is None:
@@ -504,6 +551,7 @@ class App:
                 "bottom": [self._point_dict(p) for p in self.panel_bottom.points],
             },
             "pads": [self._pad_dict(p) for p in self.overlay.pads],
+            "regions": [self._region_dict(r) for r in self.overlay.regions],
         }
         try:
             with open(path, "w") as f:
@@ -523,6 +571,14 @@ class App:
             "x": p.x, "y": p.y, "r": p.r,
             "name": p.name, "description": p.description,
             "color": p.color, "opacity": p.opacity, "side": p.side,
+        }
+
+    @staticmethod
+    def _region_dict(r: Region) -> dict:
+        return {
+            "x": r.x, "y": r.y, "w": r.w, "h": r.h,
+            "name": r.name, "description": r.description,
+            "color": r.color, "opacity": r.opacity, "side": r.side,
         }
 
     def open_project(self) -> None:
@@ -592,6 +648,7 @@ class App:
 
         self._load_points(data["alignment_points"])
         self._load_pads(data["pads"])
+        self._load_regions(data.get("regions", []))
         self._apply_view_state(data["view"])
 
         self.project_path = path
@@ -645,7 +702,29 @@ class App:
         for v in self._pad_views():
             v.selected_pad = None
         if self.overlay.pads:
-            self._last_pad_radius = self.overlay.pads[-1].r
+            self._set_last_pad_radius(self.overlay.pads[-1].r)
+
+    def _load_regions(self, regions_data: list) -> None:
+        try:
+            new_regions = [
+                Region(x=int(r["x"]), y=int(r["y"]),
+                       w=int(r.get("w", 80)), h=int(r.get("h", 50)),
+                       name=str(r.get("name", "")),
+                       description=str(r.get("description", "")),
+                       color=str(r.get("color", "#0a84ff")),
+                       opacity=float(r.get("opacity", 0.3)),
+                       side=normalize_side(str(r.get("side", "top"))))
+                for r in regions_data
+            ]
+        except (KeyError, TypeError, ValueError) as e:
+            messagebox.showerror("Bad region data", str(e))
+            new_regions = []
+        self.overlay.regions.clear()
+        self.overlay.regions.extend(new_regions)
+        for v in self._pad_views():
+            v.selected_region = None
+        if self.overlay.regions:
+            self._last_region_opacity = self.overlay.regions[-1].opacity
 
     def _apply_view_state(self, view: dict) -> None:
         for v in self._pad_views():
@@ -754,11 +833,68 @@ class App:
     def on_resize_pad(self, idx: int, r: int) -> None:
         if idx >= len(self.overlay.pads):
             return
-        self._last_pad_radius = r
+        self._set_last_pad_radius(r)
         self._draw_pad_views()
+
+    def _set_last_pad_radius(self, r: int) -> None:
+        self._last_pad_radius = r
+        for v in self._pad_views():
+            v.next_pad_radius = r
 
     def on_pad_deselect(self) -> None:
         self._set_selected_pad(None)
+
+    # ---------------------------------------------------- region callbacks
+
+    def on_place_region(self, tx: float, ty: float, w: float, h: float,
+                        side: Side, color: str) -> None:
+        if self.overlay.top is None:
+            return
+        W, H = self.overlay.top.size
+        tx = float(np.clip(tx, 0, W - 1))
+        ty = float(np.clip(ty, 0, H - 1))
+        w_i = max(REGION_MIN, min(REGION_MAX, int(round(w))))
+        h_i = max(REGION_MIN, min(REGION_MAX, int(round(h))))
+        if self.single_image_mode:
+            side = "top"
+        region = Region(
+            x=int(round(tx)), y=int(round(ty)),
+            w=w_i, h=h_i,
+            color=color,
+            opacity=self._last_region_opacity,
+            side=side,
+        )
+        self.overlay.regions.append(region)
+        self._set_selected_region(len(self.overlay.regions) - 1)
+        self.status.config(text=f"Placed region on {side.upper()} side — press E to edit.")
+
+    def on_grab_region(self, idx: int) -> None:
+        self._set_selected_region(idx)
+
+    def on_move_region(self, idx: int, tx: float, ty: float) -> None:
+        if idx >= len(self.overlay.regions) or self.overlay.top is None:
+            return
+        W, H = self.overlay.top.size
+        tx = float(np.clip(tx, 0, W - 1))
+        ty = float(np.clip(ty, 0, H - 1))
+        region = self.overlay.regions[idx]
+        region.x = int(round(tx)); region.y = int(round(ty))
+        self._draw_pad_views()
+
+    def on_resize_region(self, idx: int, tx: float, ty: float,
+                         w: float, h: float) -> None:
+        if idx >= len(self.overlay.regions):
+            return
+        # The view already updated x/y/w/h live; this fires once on release.
+        self._draw_pad_views()
+
+    def on_region_deselect(self) -> None:
+        self._set_selected_region(None)
+
+    def _on_tool_mode_change(self) -> None:
+        mode = self.tool_mode.get()
+        for v in self._pad_views():
+            v.set_tool_mode(mode)
 
     # ----------------------------------------------------- pad-view helpers
 
@@ -768,6 +904,16 @@ class App:
     def _set_selected_pad(self, idx: int | None) -> None:
         for v in self._pad_views():
             v.selected_pad = idx
+            if idx is not None:
+                v.selected_region = None
+        self._update_shortcut_bar()
+        self._draw_pad_views()
+
+    def _set_selected_region(self, idx: int | None) -> None:
+        for v in self._pad_views():
+            v.selected_region = idx
+            if idx is not None:
+                v.selected_pad = None
         self._update_shortcut_bar()
         self._draw_pad_views()
 
@@ -857,7 +1003,7 @@ class App:
             size_lbl.config(text=f"{r}px")
             if pad.r != r:
                 pad.r = r
-                self._last_pad_radius = r
+                self._set_last_pad_radius(r)
                 self._draw_pad_views()
 
         def delete_pad():
@@ -885,6 +1031,138 @@ class App:
         btns = ttk.Frame(frm)
         btns.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         ttk.Button(btns, text="Delete pad", command=delete_pad).pack(side="left")
+        ttk.Button(btns, text="Close",
+                   command=lambda: (remember_geometry(), win.destroy())).pack(side="right")
+        win.bind("<Escape>", lambda e: (remember_geometry(), win.destroy()))
+        name_entry.focus_set()
+        name_entry.icursor("end")
+
+    def _open_region_editor(self, idx: int) -> None:
+        if idx < 0 or idx >= len(self.overlay.regions):
+            return
+        region = self.overlay.regions[idx]
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Region #{idx + 1}")
+        win.transient(self.root)
+        win.minsize(420, 420)
+        if self._region_editor_geometry:
+            try:
+                win.geometry(self._region_editor_geometry)
+            except tk.TclError:
+                pass
+
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        frm.columnconfigure(1, weight=1)
+        frm.rowconfigure(1, weight=1)
+
+        ttk.Label(frm, text="Name:").grid(row=0, column=0, sticky="w")
+        name_var = tk.StringVar(value=region.name)
+        name_entry = ttk.Entry(frm, textvariable=name_var)
+        name_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=2)
+
+        ttk.Label(frm, text="Description:").grid(row=1, column=0, sticky="nw", pady=(8, 0))
+        desc_text = tk.Text(frm, width=40, height=8, wrap="word")
+        desc_text.insert("1.0", region.description)
+        desc_text.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(8, 0))
+
+        ttk.Label(frm, text="Color:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        color_swatch = tk.Button(frm, text="  ", width=4, relief="ridge",
+                                 bg=region.color, activebackground=region.color)
+        color_swatch.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        ttk.Label(frm, text="Opacity:").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        op_var = tk.DoubleVar(value=region.opacity)
+        ttk.Scale(frm, from_=0.0, to=1.0, variable=op_var, orient="horizontal",
+                  length=200).grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+
+        ttk.Label(frm, text="Width:").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        w_row = ttk.Frame(frm)
+        w_row.grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        w_var = tk.DoubleVar(value=region.w)
+        ttk.Scale(w_row, from_=REGION_MIN, to=400, variable=w_var,
+                  orient="horizontal", length=180).pack(side="left")
+        w_lbl = ttk.Label(w_row, text=f"{region.w}px", width=7)
+        w_lbl.pack(side="left", padx=(6, 0))
+
+        ttk.Label(frm, text="Height:").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        h_row = ttk.Frame(frm)
+        h_row.grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        h_var = tk.DoubleVar(value=region.h)
+        ttk.Scale(h_row, from_=REGION_MIN, to=400, variable=h_var,
+                  orient="horizontal", length=180).pack(side="left")
+        h_lbl = ttk.Label(h_row, text=f"{region.h}px", width=7)
+        h_lbl.pack(side="left", padx=(6, 0))
+
+        ttk.Label(frm, text=f"Side: {region.side.upper()}", foreground="#666").grid(
+            row=6, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+
+        def pick_color():
+            result = colorchooser.askcolor(color=region.color,
+                                           title="Region color", parent=win)
+            if not result or not result[1]:
+                return
+            region.color = result[1]
+            color_swatch.config(bg=region.color, activebackground=region.color)
+            self._draw_pad_views()
+        color_swatch.config(command=pick_color)
+
+        def commit_name(*_):
+            region.name = name_var.get()
+            self._update_shortcut_bar()
+            self._draw_pad_views()
+
+        def commit_description(_=None):
+            region.description = desc_text.get("1.0", "end-1c")
+            desc_text.edit_modified(False)
+
+        def commit_opacity(*_):
+            region.opacity = float(op_var.get())
+            self._last_region_opacity = region.opacity
+            self._draw_pad_views()
+
+        def commit_w(*_):
+            v = max(REGION_MIN, min(REGION_MAX, int(round(w_var.get()))))
+            w_lbl.config(text=f"{v}px")
+            if region.w != v:
+                region.w = v
+                self._draw_pad_views()
+
+        def commit_h(*_):
+            v = max(REGION_MIN, min(REGION_MAX, int(round(h_var.get()))))
+            h_lbl.config(text=f"{v}px")
+            if region.h != v:
+                region.h = v
+                self._draw_pad_views()
+
+        def delete_region():
+            if region in self.overlay.regions:
+                self.overlay.regions.remove(region)
+            for v in self._pad_views():
+                v.selected_region = None
+            self._update_shortcut_bar()
+            self._draw_pad_views()
+            win.destroy()
+
+        def remember_geometry(_=None):
+            try:
+                self._region_editor_geometry = win.geometry()
+            except tk.TclError:
+                pass
+
+        name_var.trace_add("write", commit_name)
+        desc_text.bind("<<Modified>>", commit_description)
+        op_var.trace_add("write", commit_opacity)
+        w_var.trace_add("write", commit_w)
+        h_var.trace_add("write", commit_h)
+        win.bind("<Configure>", remember_geometry)
+        win.protocol("WM_DELETE_WINDOW",
+                     lambda: (remember_geometry(), win.destroy()))
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        ttk.Button(btns, text="Delete region", command=delete_region).pack(side="left")
         ttk.Button(btns, text="Close",
                    command=lambda: (remember_geometry(), win.destroy())).pack(side="right")
         win.bind("<Escape>", lambda e: (remember_geometry(), win.destroy()))
