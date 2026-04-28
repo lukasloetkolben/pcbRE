@@ -70,6 +70,14 @@ class ImageView:
         c.bind("<Button-5>", self._on_wheel)
         c.bind("<Double-Button-1>", lambda e: self.fit())
         c.bind("<Configure>", self._on_configure)
+        # Right/middle button drag is handled by _pan_start/_pan_drag in the
+        # subclass bindings; without an explicit release binding the
+        # pan_anchor leaks and trips up the next gesture's release path.
+        for ev in ("<ButtonRelease-2>", "<ButtonRelease-3>"):
+            c.bind(ev, self._pan_end)
+
+    def _pan_end(self, e=None) -> None:
+        self._pan_anchor = None
 
     # Subclass hooks.
     def _content_size(self) -> tuple[int, int] | None: return None
