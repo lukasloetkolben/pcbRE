@@ -44,10 +44,6 @@ ALIGN_DISABLED_FG = "#6c6c70"
 
 _DELETE_KEY_HINT = "Backspace" if sys.platform == "darwin" else "Del"
 _MOD_KEY = "Cmd" if sys.platform == "darwin" else "Ctrl"
-_DEFAULT_SHORTCUTS = (
-    "hold to place pad   ·   drag to draw region   ·   Space+drag to pan   ·   "
-    f"{_MOD_KEY}+= / {_MOD_KEY}+-  zoom   ·   {_MOD_KEY}+0  fit"
-)
 
 
 class App:
@@ -229,6 +225,7 @@ class App:
             on_resize_pad=self.on_resize_pad,
             on_pad_deselect=self.on_pad_deselect,
             on_double_click_pad=self._open_pad_editor,
+            on_pad_toggle=self.on_pad_toggle,
             on_place_region=self.on_place_region,
             on_grab_region=self.on_grab_region,
             on_move_region=self.on_move_region,
@@ -273,6 +270,26 @@ class App:
             self.root.bind(seq, lambda e: self._kb_zoom(1 / 1.18))
         for seq in ("<Command-0>", "<Control-0>"):
             self.root.bind(seq, lambda e: self.fit_views())
+        # Cmd/Ctrl + A → select all pads (pads only — regions stay untouched).
+        for seq in ("<Command-a>", "<Command-A>",
+                    "<Control-a>", "<Control-A>"):
+            self.root.bind(seq, self._on_select_all_pads)
+        # + / − resize selected pad(s) by 1 px (Tk auto-repeats while held).
+        # No selection → adjusts the default radius for the next placement.
+        for seq in ("<minus>", "<KP_Subtract>"):
+            self.root.bind(seq, lambda e: self._adjust_pad_radius(-1))
+        for seq in ("<equal>", "<plus>", "<KP_Add>"):
+            self.root.bind(seq, lambda e: self._adjust_pad_radius(+1))
+        # Esc → drop the current selection (pad / region / point pair).
+        self.root.bind("<Escape>", self._on_escape)
+        # Arrow keys nudge selected pad(s); Shift+arrow nudges by 10 px.
+        for seq, dx, dy in (
+            ("<Left>",  -1,  0), ("<Right>",  1,  0),
+            ("<Up>",     0, -1), ("<Down>",   0,  1),
+            ("<Shift-Left>",  -10,  0), ("<Shift-Right>",  10,  0),
+            ("<Shift-Up>",     0, -10), ("<Shift-Down>",    0, 10),
+        ):
+            self.root.bind(seq, lambda e, dx=dx, dy=dy: self._nudge_pads(dx, dy))
         # Spacebar held → primary-button drag pans the canvas (Photoshop /
         # Figma convention) instead of placing a pad or starting a region.
         self.root.bind("<KeyPress-space>", self._on_space_press)
@@ -343,7 +360,7 @@ class App:
                 self.op_bar.pack(fill="x")
             self.hint.config(text=(
                 "scroll = zoom · Space+drag / right / middle / Shift+drag = pan · "
-                "hold ~0.3 s = pad · drag = region · "
+                "hold ~0.25 s = pad · drag = region · "
                 "Alt+scroll on pad = resize · drag a dot to resize a region"))
             # Side-by-side view only makes sense with two images.
             if self.single_image_mode:
@@ -411,24 +428,73 @@ class App:
     # --------------------------------------------------------- bottom hint
 
     def _update_shortcut_bar(self) -> None:
-        if self._is_aligned() and self.overlay.selected_pad is not None:
+        self.shortcut_bar.config(text="   ·   ".join(self._shortcut_parts()))
+
+    def _shortcut_parts(self) -> list[str]:
+        """The bottom shortcut bar is context-aware: each selection state
+        lists exactly the keys and gestures that apply right now."""
+        DEL = _DELETE_KEY_HINT
+        MOD = _MOD_KEY
+
+        if not self._is_aligned():
+            if self.selected is not None:
+                side, idx = self.selected
+                return [
+                    f"Point #{idx + 1} ({side.upper()})",
+                    "drag = move",
+                    "drag + scroll = resize",
+                    f"{DEL} delete pair",
+                    "Esc deselect",
+                ]
+            return [
+                "click TOP, then matching BOTTOM",
+                "drag a point to move it",
+                "Space+drag pan",
+                f"{MOD}+= / {MOD}+−  zoom",
+            ]
+
+        n_pads = len(self.overlay.selected_pads)
+        if n_pads > 1:
+            return [
+                f"{n_pads} pads selected",
+                "drag = move all",
+                "+ / −  resize",
+                "arrows nudge",
+                f"{DEL} delete",
+                "Esc deselect",
+            ]
+        if self.overlay.selected_pad is not None:
             pad = self.overlay.pads[self.overlay.selected_pad]
             label = pad.name or f"#{self.overlay.selected_pad + 1}"
-            self.shortcut_bar.config(
-                text=f'Selected pad: {label}   ·   "E" edit   ·   {_DELETE_KEY_HINT} delete')
-        elif self._is_aligned() and self.overlay.selected_region is not None:
+            return [
+                f"Pad: {label}",
+                "drag = move",
+                "+ / −  resize",
+                "arrows nudge",
+                "E edit",
+                f"{DEL} delete",
+                "Esc deselect",
+            ]
+        if self.overlay.selected_region is not None:
             reg = self.overlay.regions[self.overlay.selected_region]
             label = reg.name or f"R{self.overlay.selected_region + 1}"
-            self.shortcut_bar.config(
-                text=(f'Selected region: {label}   ·   "E" edit   ·   '
-                      f"{_DELETE_KEY_HINT} delete   ·   drag dot to resize"))
-        elif (not self._is_aligned()) and self.selected is not None:
-            side, idx = self.selected
-            self.shortcut_bar.config(
-                text=f"Selected point #{idx + 1} ({side.upper()})   "
-                     f"·   {_DELETE_KEY_HINT} delete pair")
-        else:
-            self.shortcut_bar.config(text=_DEFAULT_SHORTCUTS)
+            return [
+                f"Region: {label}",
+                "drag = move",
+                "drag a dot = resize",
+                "E edit",
+                f"{DEL} delete",
+                "Esc deselect",
+            ]
+        return [
+            "hold = pad",
+            "drag = region",
+            f"Shift / {MOD}-click pad to multi-select",
+            f"{MOD}+A select all",
+            "+ / −  default size",
+            "Space+drag pan",
+            f"{MOD}+= / {MOD}+−  zoom",
+        ]
 
     def _focused_in_text_input(self) -> bool:
         focused = self.root.focus_get()
@@ -437,6 +503,8 @@ class App:
     def _on_e_key(self, e=None) -> None:
         if self._focused_in_text_input() or not self._is_aligned():
             return
+        # Editor only opens for a single-pad selection — there's no meaningful
+        # "edit all" target.
         pad_idx = self.overlay.selected_pad
         if pad_idx is not None and pad_idx < len(self.overlay.pads):
             self._open_pad_editor(pad_idx)
@@ -445,11 +513,81 @@ class App:
         if reg_idx is not None and reg_idx < len(self.overlay.regions):
             self._open_region_editor(reg_idx)
 
+    def _on_select_all_pads(self, e=None) -> None:
+        if self._focused_in_text_input():
+            return
+        if not self._is_aligned() or not self.overlay.pads:
+            return
+        self._set_selected_pads(set(range(len(self.overlay.pads))))
+        return "break"
+
+    def _adjust_pad_radius(self, delta: int) -> None:
+        """Resize selected pad(s) by `delta` px, or change the default
+        pad radius if nothing is selected."""
+        if self._focused_in_text_input():
+            return
+        indices = self.overlay.selected_pads
+        if not indices:
+            new_r = max(RADIUS_MIN, min(RADIUS_MAX, self._last_pad_radius + delta))
+            if new_r != self._last_pad_radius:
+                self._set_last_pad_radius(new_r)
+                self.status.config(text=f"Default pad size: {new_r}px")
+            return
+        changed = False
+        for idx in indices:
+            if idx >= len(self.overlay.pads):
+                continue
+            pad = self.overlay.pads[idx]
+            new_r = max(RADIUS_MIN, min(RADIUS_MAX, pad.r + delta))
+            if new_r != pad.r:
+                pad.r = new_r
+                changed = True
+        if not changed:
+            return
+        if len(indices) == 1:
+            (idx,) = indices
+            self._set_last_pad_radius(self.overlay.pads[idx].r)
+        self._draw_pad_views()
+        self._mark_dirty()
+
+    def _nudge_pads(self, dx: int, dy: int) -> None:
+        if self._focused_in_text_input():
+            return
+        indices = self.overlay.selected_pads
+        if not indices or self.overlay.top is None:
+            return
+        W, H = self.overlay.top.size
+        changed = False
+        for idx in indices:
+            if idx >= len(self.overlay.pads):
+                continue
+            pad = self.overlay.pads[idx]
+            new_x = int(np.clip(pad.x + dx, 0, W - 1))
+            new_y = int(np.clip(pad.y + dy, 0, H - 1))
+            if (new_x, new_y) != (pad.x, pad.y):
+                pad.x, pad.y = new_x, new_y
+                changed = True
+        if changed:
+            self._draw_pad_views()
+            self._mark_dirty()
+
+    def _on_escape(self, e=None) -> None:
+        if self._focused_in_text_input():
+            return
+        if self.overlay.selected_pads or self.overlay.selected_pad is not None:
+            self._set_selected_pads(set())
+            return
+        if self.overlay.selected_region is not None:
+            self._set_selected_region(None)
+            return
+        if self.selected is not None:
+            self._select(None, None)
+
     def _on_delete_key(self, e=None) -> None:
         if self._focused_in_text_input():
             return
-        if self._is_aligned() and self.overlay.selected_pad is not None:
-            self._delete_selected_pad()
+        if self._is_aligned() and self.overlay.selected_pads:
+            self._delete_selected_pads()
             return
         if self._is_aligned() and self.overlay.selected_region is not None:
             self._delete_selected_region()
@@ -457,12 +595,12 @@ class App:
         if (not self._is_aligned()) and self.selected is not None:
             self._delete_selected_point_pair()
 
-    def _delete_selected_pad(self) -> None:
-        idx = self.overlay.selected_pad
-        if idx is None or idx >= len(self.overlay.pads):
-            return
-        del self.overlay.pads[idx]
-        self._set_selected_pad(None)
+    def _delete_selected_pads(self) -> None:
+        # Delete from the highest index down so earlier indices stay valid.
+        for idx in sorted(self.overlay.selected_pads, reverse=True):
+            if idx < len(self.overlay.pads):
+                del self.overlay.pads[idx]
+        self._set_selected_pads(set())
         self._mark_dirty()
 
     def _delete_selected_region(self) -> None:
@@ -922,6 +1060,16 @@ class App:
     def on_grab_pad(self, idx: int) -> None:
         self._set_selected_pad(idx)
 
+    def on_pad_toggle(self, idx: int) -> None:
+        if idx >= len(self.overlay.pads):
+            return
+        new_set = set(self.overlay.selected_pads)
+        if idx in new_set:
+            new_set.remove(idx)
+        else:
+            new_set.add(idx)
+        self._set_selected_pads(new_set)
+
     def on_move_pad(self, idx: int, tx: float, ty: float) -> None:
         if idx >= len(self.overlay.pads) or self.overlay.top is None:
             return
@@ -1003,9 +1151,17 @@ class App:
         return [self.overlay, self.overlay_left, self.overlay_right]
 
     def _set_selected_pad(self, idx: int | None) -> None:
+        self._set_selected_pads({idx} if idx is not None else set())
+
+    def _set_selected_pads(self, indices) -> None:
+        pads_set = set(indices)
+        # Editor flow keys off `selected_pad`, which is meaningful only when
+        # the multi-set is a single primary; otherwise None.
+        primary = next(iter(pads_set)) if len(pads_set) == 1 else None
         for v in self._pad_views():
-            v.selected_pad = idx
-            if idx is not None:
+            v.selected_pads = pads_set
+            v.selected_pad = primary
+            if pads_set:
                 v.selected_region = None
         self._update_shortcut_bar()
         self._draw_pad_views()
@@ -1015,6 +1171,9 @@ class App:
             v.selected_region = idx
             if idx is not None:
                 v.selected_pad = None
+                # Selecting a region also drops any pad multi-selection so
+                # the bottom bar reflects the actual current target.
+                v.selected_pads = set()
         self._update_shortcut_bar()
         self._draw_pad_views()
 
@@ -1115,9 +1274,7 @@ class App:
         def delete_pad():
             if pad in self.overlay.pads:
                 self.overlay.pads.remove(pad)
-            self.overlay.selected_pad = None
-            self._update_shortcut_bar()
-            self._draw_pad_views()
+            self._set_selected_pads(set())
             self._mark_dirty()
             win.destroy()
 

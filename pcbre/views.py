@@ -267,7 +267,8 @@ class LongPress:
 # ---------------------------------------------------------------------------
 
 class Panel(ImageView):
-    CLICK_THRESHOLD = 3
+    # Loose enough that trackpad press wobble doesn't kill a long-press hold.
+    CLICK_THRESHOLD = 6
 
     def __init__(self, parent: tk.Widget, side: Side,
                  on_place: Callable[[Side, float, float], None],
@@ -512,7 +513,8 @@ class Tooltip:
 # ---------------------------------------------------------------------------
 
 class OverlayView(ImageView):
-    CLICK_THRESHOLD = 3
+    # Loose enough that trackpad press wobble doesn't kill a long-press hold.
+    CLICK_THRESHOLD = 6
     HANDLE_R = 5  # screen-px radius of the resize dots on a selected region
 
     def __init__(self, parent: tk.Widget,
@@ -523,6 +525,7 @@ class OverlayView(ImageView):
                  on_resize_pad:       Callable[[int, int], None] | None = None,
                  on_pad_deselect:     Callable[[], None] | None = None,
                  on_double_click_pad: Callable[[int], None] | None = None,
+                 on_pad_toggle:       Callable[[int], None] | None = None,
                  on_place_region:        Callable[[float, float, float, float, Side, str], None] | None = None,
                  on_grab_region:         Callable[[int], None] | None = None,
                  on_move_region:         Callable[[int, float, float], None] | None = None,
@@ -546,6 +549,10 @@ class OverlayView(ImageView):
         # Pads live in TOP-image coordinates so they survive view rotation/flip.
         self.pads: list[Pad] = []
         self.selected_pad: int | None = None
+        # Multi-selection: indices of all selected pads. `selected_pad` mirrors
+        # the only entry when len == 1, and is None otherwise (the editor flow
+        # depends on a single primary).
+        self.selected_pads: set[int] = set()
         self.on_place_pad = on_place_pad or (lambda x, y, s, c: None)
         self.on_grab_pad = on_grab_pad or (lambda i: None)
         self.on_move_pad = on_move_pad or (lambda i, x, y: None)
@@ -553,6 +560,7 @@ class OverlayView(ImageView):
         self.on_resize_pad = on_resize_pad or (lambda i, r: None)
         self.on_pad_deselect = on_pad_deselect or (lambda: None)
         self.on_double_click_pad = on_double_click_pad or (lambda i: None)
+        self.on_pad_toggle = on_pad_toggle or (lambda i: None)
 
         # Regions: same TOP-coord storage; rectangles stay axis-aligned through
         # the 90°/flip view transforms used here.
@@ -579,6 +587,15 @@ class OverlayView(ImageView):
         self._press_view: tuple[float, float] | None = None
         self._press_canvas: tuple[int, int] | None = None
         self._drag_pad: int | None = None
+        # Press point + original pad center, so the drag preserves the
+        # cursor's grab offset (no "jump to center" on first motion).
+        self._drag_pad_press_top: tuple[float, float] | None = None
+        self._drag_pad_orig_xy: tuple[int, int] | None = None
+        # Group drag: indices, press point in top coords, and each pad's
+        # original (x, y) so we can apply a uniform delta on motion.
+        self._drag_pads: list[int] | None = None
+        self._drag_pads_press_top: tuple[float, float] | None = None
+        self._drag_pads_orig_xy: list[tuple[int, int]] | None = None
         self._drag_region: int | None = None
         self._region_resize_idx: int | None = None
         self._region_resize_handle: str | None = None
@@ -604,7 +621,13 @@ class OverlayView(ImageView):
         c.bind("<Alt-ButtonPress-1>", self._on_alt_press)
         for ev in ("<Alt-MouseWheel>", "<Alt-Button-4>", "<Alt-Button-5>"):
             c.bind(ev, self._on_alt_wheel)
-        for ev in ("<ButtonPress-2>", "<ButtonPress-3>", "<Shift-ButtonPress-1>"):
+        # Shift+click pad toggles in multi-selection; Shift+drag on empty
+        # still pans (one handler dispatches both).
+        c.bind("<Shift-ButtonPress-1>", self._on_shift_press)
+        # Cmd/Ctrl+click pad: pad-only toggle (macOS / Windows convention).
+        c.bind("<Command-ButtonPress-1>", self._on_toggle_press)
+        c.bind("<Control-ButtonPress-1>", self._on_toggle_press)
+        for ev in ("<ButtonPress-2>", "<ButtonPress-3>"):
             c.bind(ev, self._pan_start)
         for ev in ("<B2-Motion>", "<B3-Motion>", "<Shift-B1-Motion>"):
             c.bind(ev, self._pan_drag)
@@ -863,7 +886,20 @@ class OverlayView(ImageView):
 
         pad_hit = self._hit_pad(vx, vy)
         if pad_hit is not None:
+            # Pad already part of a multi-selection → drag the group, keep
+            # the selection intact (don't fire on_grab_pad which would
+            # collapse the set down to this single pad).
+            if pad_hit in self.selected_pads and len(self.selected_pads) > 1:
+                self._drag_pads = sorted(self.selected_pads)
+                self._drag_pads_press_top = self.view_to_top(vx, vy)
+                self._drag_pads_orig_xy = [
+                    (self.pads[i].x, self.pads[i].y) for i in self._drag_pads]
+                self._press_view = (vx, vy)
+                return
             self._drag_pad = pad_hit
+            self._drag_pad_press_top = self.view_to_top(vx, vy)
+            self._drag_pad_orig_xy = (
+                self.pads[pad_hit].x, self.pads[pad_hit].y)
             self._press_view = None
             if self.selected_region is not None:
                 self.selected_region = None
@@ -884,9 +920,10 @@ class OverlayView(ImageView):
             self.on_grab_region(region_hit)
             return
 
-        # Empty space: drop any prior selection.
-        if self.selected_pad is not None:
+        # Empty space: drop any prior selection (single or multi).
+        if self.selected_pad is not None or self.selected_pads:
             self.selected_pad = None
+            self.selected_pads = set()
             self.on_pad_deselect()
         if self.selected_region is not None:
             self.selected_region = None
@@ -908,6 +945,30 @@ class OverlayView(ImageView):
         target_r = self.next_pad_radius * self.zoom
         self._long_press.start(e.x, e.y, color=self._pending_pad_color,
                                target_r=target_r)
+
+    def _on_shift_press(self, e) -> None:
+        """Shift+click on a pad → toggle in multi-selection. On empty space
+        it falls through to a pan, matching the existing Shift+drag pan."""
+        if self._content_size() is None:
+            return
+        vx, vy = self.canvas_to_orig(e.x, e.y)
+        pad_hit = self._hit_pad(vx, vy)
+        if pad_hit is not None:
+            self._tooltip.hide(self.schedule_draw)
+            self.on_pad_toggle(pad_hit)
+            return
+        self._pan_start(e)
+        set_canvas_cursor(self.canvas, PAN_CURSORS_GRAB)
+
+    def _on_toggle_press(self, e) -> None:
+        """Cmd/Ctrl+click on a pad → toggle in multi-selection."""
+        if self._content_size() is None:
+            return
+        vx, vy = self.canvas_to_orig(e.x, e.y)
+        pad_hit = self._hit_pad(vx, vy)
+        if pad_hit is not None:
+            self._tooltip.hide(self.schedule_draw)
+            self.on_pad_toggle(pad_hit)
 
     def _on_alt_press(self, e) -> None:
         """Alt+click on a selected region's edge dot starts a resize."""
@@ -943,11 +1004,24 @@ class OverlayView(ImageView):
             new_y = self._region_drag_orig_xy[1] + dy
             self.on_move_region(self._drag_region, new_x, new_y)
             return
+        if self._drag_pads is not None:
+            self._click_moved = True
+            vx, vy = self.canvas_to_orig(e.x, e.y)
+            tx, ty = self.view_to_top(vx, vy)
+            dx = tx - self._drag_pads_press_top[0]
+            dy = ty - self._drag_pads_press_top[1]
+            for idx, (ox, oy) in zip(self._drag_pads, self._drag_pads_orig_xy):
+                self.on_move_pad(idx, ox + dx, oy + dy)
+            return
         if self._drag_pad is not None:
             self._click_moved = True
             vx, vy = self.canvas_to_orig(e.x, e.y)
             tx, ty = self.view_to_top(vx, vy)
-            self.on_move_pad(self._drag_pad, tx, ty)
+            dx = tx - self._drag_pad_press_top[0]
+            dy = ty - self._drag_pad_press_top[1]
+            self.on_move_pad(self._drag_pad,
+                             self._drag_pad_orig_xy[0] + dx,
+                             self._drag_pad_orig_xy[1] + dy)
             return
         if self._region_create_start is not None:
             self._click_moved = True
@@ -963,6 +1037,10 @@ class OverlayView(ImageView):
         if self._press_canvas is not None and self._press_view is not None:
             x0, y0 = self._press_canvas
             if abs(e.x - x0) <= self.CLICK_THRESHOLD and abs(e.y - y0) <= self.CLICK_THRESHOLD:
+                return
+            # Once the long-press has filled, the pad is locked in — late
+            # wobble shouldn't downgrade an already-armed hold into a region.
+            if self._long_press.ready:
                 return
             self._click_moved = True
             self._long_press.cancel()
@@ -992,11 +1070,24 @@ class OverlayView(ImageView):
             self._press_canvas = None
             return
 
-        # Pad drag drop.
+        # Group pad drag: each pad already moved live via on_move_pad.
+        if self._drag_pads is not None:
+            if self._click_moved:
+                for idx in self._drag_pads:
+                    self.on_drop_pad(idx)
+            self._drag_pads = None
+            self._drag_pads_press_top = None
+            self._drag_pads_orig_xy = None
+            self._press_view = None
+            self._press_canvas = None
+            return
+
         if self._drag_pad is not None:
             if self._click_moved:
                 self.on_drop_pad(self._drag_pad)
             self._drag_pad = None
+            self._drag_pad_press_top = None
+            self._drag_pad_orig_xy = None
             self._press_view = None
             self._press_canvas = None
             return
@@ -1291,14 +1382,19 @@ class OverlayView(ImageView):
             X = (vx - self.ox) * self.zoom
             Y = (vy - self.oy) * self.zoom
             R = max(3.0, p.r * self.zoom)
+            is_in_set = i in self.selected_pads
+            is_primary = i == self.selected_pad
             c.create_oval(X - R, Y - R, X + R, Y + R,
-                          outline=color, width=3 if i == self.selected_pad else 2)
-            if i == self.selected_pad:
+                          outline=color, width=3 if is_in_set else 2)
+            if is_in_set:
                 halo = self._fade_color("#ffffff", vis)
                 c.create_oval(X - R - 4, Y - R - 4, X + R + 4, Y + R + 4,
                               outline=halo, width=1)
-                c.create_line(X - R - 6, Y, X + R + 6, Y, fill=halo)
-                c.create_line(X, Y - R - 6, X, Y + R + 6, fill=halo)
+                # Crosshair only on the single primary so the editor target
+                # stays visually distinct in a multi-selection.
+                if is_primary:
+                    c.create_line(X - R - 6, Y, X + R + 6, Y, fill=halo)
+                    c.create_line(X, Y - R - 6, X, Y + R + 6, fill=halo)
             label = p.name or f"#{i + 1}"
             c.create_text(X + R + 6, Y, text=label, fill=color, anchor="w",
                           font=("TkDefaultFont", 10, "bold"))
