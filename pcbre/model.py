@@ -27,6 +27,8 @@ class Pad:
 
     `side` records which layer was more visible when the user dropped it,
     purely as documentation — placement is in top space regardless.
+    `number` is the auto-label index, shared with regions so the visible
+    "#N" tag counts up across both kinds.
     """
     x: int
     y: int
@@ -36,6 +38,7 @@ class Pad:
     color: str = "#ff3b30"
     opacity: float = 0.3
     side: Side = "top"
+    number: int = 0
 
 
 @dataclass
@@ -50,6 +53,7 @@ class Region:
     color: str = "#0a84ff"
     opacity: float = 0.3
     side: Side = "top"
+    number: int = 0
 
 
 def random_pad_color() -> str:

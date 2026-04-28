@@ -1366,7 +1366,7 @@ class OverlayView(ImageView):
                 ):
                     c.create_oval(hx - hr, hy - hr, hx + hr, hy + hr,
                                   fill=halo, outline=color, width=2)
-            label = reg.name or f"R{i + 1}"
+            label = reg.name or f"#{reg.number or i + 1}"
             c.create_text(X1 + 6, Y0, text=label, fill=color, anchor="nw",
                           font=("TkDefaultFont", 10, "bold"))
 
@@ -1403,7 +1403,7 @@ class OverlayView(ImageView):
                 if is_primary:
                     c.create_line(X - R - 6, Y, X + R + 6, Y, fill=halo)
                     c.create_line(X, Y - R - 6, X, Y + R + 6, fill=halo)
-            label = p.name or f"#{i + 1}"
+            label = p.name or f"#{p.number or i + 1}"
             c.create_text(X + R + 6, Y, text=label, fill=color, anchor="w",
                           font=("TkDefaultFont", 10, "bold"))
         self._tooltip.draw_into()

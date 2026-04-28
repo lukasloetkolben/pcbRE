@@ -80,6 +80,9 @@ class App:
         self._last_region_opacity = 0.3
         self._region_editor_geometry: str | None = None
         self._dirty = False
+        # Single counter for both pad and region auto-labels: the visible
+        # "#N" tag counts up across both kinds in placement order.
+        self._next_label_number = 1
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -465,7 +468,7 @@ class App:
             ]
         if self.overlay.selected_pad is not None:
             pad = self.overlay.pads[self.overlay.selected_pad]
-            label = pad.name or f"#{self.overlay.selected_pad + 1}"
+            label = pad.name or f"#{pad.number}"
             return [
                 f"Pad: {label}",
                 "drag = move",
@@ -477,7 +480,7 @@ class App:
             ]
         if self.overlay.selected_region is not None:
             reg = self.overlay.regions[self.overlay.selected_region]
-            label = reg.name or f"R{self.overlay.selected_region + 1}"
+            label = reg.name or f"#{reg.number}"
             return [
                 f"Region: {label}",
                 "drag = move",
@@ -803,6 +806,7 @@ class App:
             "x": p.x, "y": p.y, "r": p.r,
             "name": p.name, "description": p.description,
             "color": p.color, "opacity": p.opacity, "side": p.side,
+            "number": p.number,
         }
 
     @staticmethod
@@ -811,6 +815,7 @@ class App:
             "x": r.x, "y": r.y, "w": r.w, "h": r.h,
             "name": r.name, "description": r.description,
             "color": r.color, "opacity": r.opacity, "side": r.side,
+            "number": r.number,
         }
 
     def open_project(self) -> None:
@@ -881,6 +886,7 @@ class App:
         self._load_points(data["alignment_points"])
         self._load_pads(data["pads"])
         self._load_regions(data.get("regions", []))
+        self._renumber_after_load()
         self._apply_view_state(data["view"])
 
         self.project_path = path
@@ -926,7 +932,8 @@ class App:
                     description=str(p.get("description", "")),
                     color=str(p.get("color", "#ff3b30")),
                     opacity=float(p.get("opacity", 0.3)),
-                    side=normalize_side(str(p.get("side", "top"))))
+                    side=normalize_side(str(p.get("side", "top"))),
+                    number=int(p.get("number", 0)))
                 for p in pads_data
             ]
         except (KeyError, TypeError, ValueError) as e:
@@ -948,7 +955,8 @@ class App:
                        description=str(r.get("description", "")),
                        color=str(r.get("color", "#0a84ff")),
                        opacity=float(r.get("opacity", 0.3)),
-                       side=normalize_side(str(r.get("side", "top"))))
+                       side=normalize_side(str(r.get("side", "top"))),
+                       number=int(r.get("number", 0)))
                 for r in regions_data
             ]
         except (KeyError, TypeError, ValueError) as e:
@@ -960,6 +968,29 @@ class App:
             v.selected_region = None
         if self.overlay.regions:
             self._last_region_opacity = self.overlay.regions[-1].opacity
+
+    def _renumber_after_load(self) -> None:
+        """Assign a unique label number to any pad/region that was saved
+        before label numbers existed (or after a load with gaps), and set
+        the running counter to one past the largest existing number."""
+        used = {p.number for p in self.overlay.pads if p.number}
+        used |= {r.number for r in self.overlay.regions if r.number}
+        next_n = 1
+
+        def claim() -> int:
+            nonlocal next_n
+            while next_n in used:
+                next_n += 1
+            used.add(next_n)
+            return next_n
+
+        for p in self.overlay.pads:
+            if not p.number:
+                p.number = claim()
+        for r in self.overlay.regions:
+            if not r.number:
+                r.number = claim()
+        self._next_label_number = (max(used) + 1) if used else 1
 
     def _apply_view_state(self, view: dict) -> None:
         for v in self._pad_views():
@@ -1051,7 +1082,9 @@ class App:
             color=color,
             opacity=self._last_pad_opacity,
             side=side,
+            number=self._next_label_number,
         )
+        self._next_label_number += 1
         self.overlay.pads.append(pad)
         self._set_selected_pad(len(self.overlay.pads) - 1)
         self.status.config(text=f"Placed pad on {side.upper()} side — press E to edit.")
@@ -1114,7 +1147,9 @@ class App:
             color=color,
             opacity=self._last_region_opacity,
             side=side,
+            number=self._next_label_number,
         )
+        self._next_label_number += 1
         self.overlay.regions.append(region)
         self._set_selected_region(len(self.overlay.regions) - 1)
         self.status.config(text=f"Placed region on {side.upper()} side — press E to edit.")
@@ -1189,7 +1224,7 @@ class App:
         pad = self.overlay.pads[idx]
 
         win = tk.Toplevel(self.root)
-        win.title(f"Pad #{idx + 1}")
+        win.title(f"Pad #{pad.number}")
         win.transient(self.root)
         win.minsize(420, 380)
         if self._pad_editor_geometry:
@@ -1307,7 +1342,7 @@ class App:
         region = self.overlay.regions[idx]
 
         win = tk.Toplevel(self.root)
-        win.title(f"Region #{idx + 1}")
+        win.title(f"Region #{region.number}")
         win.transient(self.root)
         win.minsize(420, 420)
         if self._region_editor_geometry:
