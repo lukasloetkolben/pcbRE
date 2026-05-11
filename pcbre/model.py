@@ -9,7 +9,7 @@ from typing import Literal
 
 Side = Literal["top", "bottom"]
 
-PROJECT_VERSION = 3
+PROJECT_VERSION = 4
 PROJECT_EXT = ".pcbre"
 
 
@@ -39,6 +39,7 @@ class Pad:
     opacity: float = 0.3
     side: Side = "top"
     number: int = 0
+    label_rotation: int = 0
 
 
 @dataclass
@@ -75,8 +76,16 @@ def normalize_side(value: str) -> Side:
     return "bottom" if value in ("bot", "bottom") else "top"
 
 
+def normalize_rotation(value: object) -> int:
+    try:
+        angle = int(value) % 360
+    except (TypeError, ValueError):
+        return 0
+    return angle if angle in (0, 90, 180, 270) else 0
+
+
 def normalize_project_data(data: dict) -> dict:
-    """Translate a v1 or v2 project document into a v2-shaped dict."""
+    """Translate legacy project documents into the current normalized shape."""
     if int(data.get("version", 1)) >= 2:
         images = data.get("images") or {}
         view = data.get("view") or {}
@@ -86,7 +95,7 @@ def normalize_project_data(data: dict) -> dict:
             "bottom_mirror": bool(data.get("bottom_mirror", True)),
             "single_image": bool(data.get("single_image", False)),
             "view": {
-                "rotation": int(view.get("rotation", 0)) % 360,
+                "rotation": normalize_rotation(view.get("rotation", 0)),
                 "flipped": bool(view.get("flipped", False)),
                 "opacity": float(view.get("opacity", 0.5)),
                 "mode": str(view.get("mode", "overlay")),
@@ -104,7 +113,7 @@ def normalize_project_data(data: dict) -> dict:
             "bottom_mirror": bool(data.get("bot_mirror", True)),
             "single_image": False,
             "view": {
-                "rotation": int(data.get("view_rotation", 0)) % 360,
+                "rotation": normalize_rotation(data.get("view_rotation", 0)),
                 "flipped": bool(data.get("view_flipped", False)),
                 "opacity": float(data.get("view_opacity", 0.5)),
                 "mode": str(data.get("view_mode", "overlay")),
@@ -116,6 +125,4 @@ def normalize_project_data(data: dict) -> dict:
             "pads": list(data.get("pads") or []),
             "regions": [],
         }
-    if out["view"]["rotation"] not in (0, 90, 180, 270):
-        out["view"]["rotation"] = 0
     return out

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import sys
@@ -21,6 +22,7 @@ from .model import (
     Region,
     Side,
     normalize_project_data,
+    normalize_rotation,
     normalize_side,
 )
 from .views import (
@@ -67,6 +69,7 @@ class App:
 
         self.bottom_mirror = tk.BooleanVar(value=True)
         self.opacity = tk.DoubleVar(value=0.5)
+        self.open_editor_on_create = tk.BooleanVar(value=True)
         self.radius = tk.DoubleVar(value=DEFAULT_RADIUS)
         # New projects open straight into overlay once alignment is in place.
         self.mode = tk.StringVar(value="overlay")
@@ -171,6 +174,9 @@ class App:
         ttk.Label(o, text="Opacity:").pack(side="left", padx=(0, 4))
         ttk.Scale(o, from_=0.0, to=1.0, variable=self.opacity, orient="horizontal",
                   length=200, command=lambda *_: self.on_opacity_change()).pack(side="left")
+        ttk.Separator(o, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Checkbutton(o, text="Edit new", variable=self.open_editor_on_create).pack(
+            side="left")
 
     def _build_status_area(self) -> None:
         self.status = ttk.Label(self.root, text="Load a top and bottom image to begin.")
@@ -262,6 +268,8 @@ class App:
             self.root.bind(seq, lambda e, f=fn: f())
         self.root.bind("<KeyPress-e>", self._on_e_key)
         self.root.bind("<KeyPress-E>", self._on_e_key)
+        self.root.bind("<KeyPress-r>", self._on_r_key)
+        self.root.bind("<KeyPress-R>", self._on_r_key)
         for seq in ("<Delete>", "<BackSpace>", "<KP_Delete>"):
             self.root.bind(seq, self._on_delete_key)
         # Cmd/Ctrl + = / + / - / 0 → zoom in / zoom out / fit, centered on the
@@ -285,6 +293,8 @@ class App:
             self.root.bind(seq, lambda e: self._adjust_pad_radius(+1))
         # Esc → drop the current selection (pad / region / point pair).
         self.root.bind("<Escape>", self._on_escape)
+        # Tab toggles the overlay blend between TOP/front and BOTTOM/back.
+        self.root.bind("<Tab>", self._on_tab_key)
         # Arrow keys nudge selected pad(s); Shift+arrow nudges by 10 px.
         for seq, dx, dy in (
             ("<Left>",  -1,  0), ("<Right>",  1,  0),
@@ -462,6 +472,7 @@ class App:
                 f"{n_pads} pads selected",
                 "drag = move all",
                 "+ / −  resize",
+                "R rotate text",
                 "arrows nudge",
                 f"{DEL} delete",
                 "Esc deselect",
@@ -473,6 +484,7 @@ class App:
                 f"Pad: {label}",
                 "drag = move",
                 "+ / −  resize",
+                "R rotate text",
                 "arrows nudge",
                 "E edit",
                 f"{DEL} delete",
@@ -492,6 +504,7 @@ class App:
         return [
             "hold = pad",
             "drag = region",
+            "Tab switch layer",
             f"Shift / {MOD}-click pad to multi-select",
             f"{MOD}+A select all",
             "+ / −  default size",
@@ -502,6 +515,67 @@ class App:
     def _focused_in_text_input(self) -> bool:
         focused = self.root.focus_get()
         return isinstance(focused, (tk.Entry, ttk.Entry, tk.Text))
+
+    def _center_editor(self, win: tk.Toplevel) -> None:
+        win.update_idletasks()
+        self.root.update_idletasks()
+        min_w, min_h = win.minsize()
+        w = max(min_w, win.winfo_width(), win.winfo_reqwidth())
+        h = max(min_h, win.winfo_height(), win.winfo_reqheight())
+        root_w = self.root.winfo_width()
+        root_h = self.root.winfo_height()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        x = root_x + max(0, (root_w - w) // 2)
+        y = root_y + max(0, (root_h - h) // 2)
+        screen_w = win.winfo_screenwidth()
+        screen_h = win.winfo_screenheight()
+        x = min(max(0, x), max(0, screen_w - w))
+        y = min(max(0, y), max(0, screen_h - h))
+        win.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _focus_editor(self, win: tk.Toplevel, focus_widget: tk.Widget) -> None:
+        def pointer_is_in_app() -> bool:
+            try:
+                widget = self.root.winfo_containing(
+                    self.root.winfo_pointerx(), self.root.winfo_pointery())
+            except tk.TclError:
+                return False
+            if widget is None:
+                return False
+            try:
+                return widget.winfo_toplevel() in (self.root, win)
+            except tk.TclError:
+                return False
+
+        def activate(move_pointer: bool = False) -> None:
+            try:
+                if not win.winfo_exists() or not focus_widget.winfo_exists():
+                    return
+                win.lift(self.root)
+                focus_widget.focus_force()
+                if move_pointer and pointer_is_in_app():
+                    # Focus-follows-mouse WMs would otherwise refocus the
+                    # canvas on the next tiny move if the pointer stayed behind.
+                    focus_widget.event_generate(
+                        "<Motion>",
+                        warp=True,
+                        x=max(1, focus_widget.winfo_width() // 2),
+                        y=max(1, focus_widget.winfo_height() // 2),
+                    )
+            except tk.TclError:
+                pass
+
+        try:
+            self._center_editor(win)
+        except tk.TclError:
+            pass
+        try:
+            win.deiconify()
+        except tk.TclError:
+            pass
+        activate(move_pointer=True)
+        win.after(75, activate)
 
     def _on_e_key(self, e=None) -> None:
         if self._focused_in_text_input() or not self._is_aligned():
@@ -515,6 +589,30 @@ class App:
         reg_idx = self.overlay.selected_region
         if reg_idx is not None and reg_idx < len(self.overlay.regions):
             self._open_region_editor(reg_idx)
+
+    def _on_r_key(self, e=None) -> str | None:
+        if self._focused_in_text_input() or not self._is_aligned():
+            return None
+        indices = {
+            idx for idx in self.overlay.selected_pads
+            if 0 <= idx < len(self.overlay.pads)
+        }
+        if not indices:
+            return None
+        for idx in indices:
+            pad = self.overlay.pads[idx]
+            pad.label_rotation = normalize_rotation(pad.label_rotation + 90)
+        self._draw_pad_views()
+        self._mark_dirty()
+        if len(indices) == 1:
+            (idx,) = indices
+            label = self.overlay.pads[idx].name or f"#{self.overlay.pads[idx].number}"
+            self.status.config(
+                text=f"Rotated text for pad {label}: "
+                     f"{self.overlay.pads[idx].label_rotation}°")
+        else:
+            self.status.config(text=f"Rotated text for {len(indices)} pads.")
+        return "break"
 
     def _on_select_all_pads(self, e=None) -> None:
         if self._focused_in_text_input():
@@ -585,6 +683,16 @@ class App:
             return
         if self.selected is not None:
             self._select(None, None)
+
+    def _on_tab_key(self, e=None) -> str | None:
+        if (self._focused_in_text_input()
+                or not self._is_aligned()
+                or self.single_image_mode
+                or self.mode.get() != "overlay"):
+            return None
+        self.opacity.set(1.0 if self.opacity.get() <= 0.5 else 0.0)
+        self.on_opacity_change()
+        return "break"
 
     def _on_delete_key(self, e=None) -> None:
         if self._focused_in_text_input():
@@ -807,6 +915,7 @@ class App:
             "name": p.name, "description": p.description,
             "color": p.color, "opacity": p.opacity, "side": p.side,
             "number": p.number,
+            "label_rotation": p.label_rotation,
         }
 
     @staticmethod
@@ -824,7 +933,7 @@ class App:
             filetypes=[("pcbRE Project", f"*{PROJECT_EXT}"),
                        ("JSON", "*.json"), ("All files", "*.*")])
         if path:
-            self._do_open(path)
+            self.open_project(path)
 
     def _resolve(self, ref: str | None, proj_dir: Path) -> str | None:
         if not ref:
@@ -838,7 +947,7 @@ class App:
         alt = proj_dir / Path(ref).name
         return str(alt) if alt.exists() else None
 
-    def _do_open(self, path: str) -> None:
+    def open_project(self, path: str) -> None:
         try:
             with open(path) as f:
                 doc = json.load(f)
@@ -933,7 +1042,9 @@ class App:
                     color=str(p.get("color", "#ff3b30")),
                     opacity=float(p.get("opacity", 0.3)),
                     side=normalize_side(str(p.get("side", "top"))),
-                    number=int(p.get("number", 0)))
+                    number=int(p.get("number", 0)),
+                    label_rotation=normalize_rotation(
+                        p.get("label_rotation", 0)))
                 for p in pads_data
             ]
         except (KeyError, TypeError, ValueError) as e:
@@ -1086,9 +1197,12 @@ class App:
         )
         self._next_label_number += 1
         self.overlay.pads.append(pad)
-        self._set_selected_pad(len(self.overlay.pads) - 1)
+        idx = len(self.overlay.pads) - 1
+        self._set_selected_pad(idx)
         self.status.config(text=f"Placed pad on {side.upper()} side — press E to edit.")
         self._mark_dirty()
+        if self.open_editor_on_create.get():
+            self.root.after_idle(lambda i=idx: self._open_pad_editor(i))
 
     def on_grab_pad(self, idx: int) -> None:
         self._set_selected_pad(idx)
@@ -1151,9 +1265,12 @@ class App:
         )
         self._next_label_number += 1
         self.overlay.regions.append(region)
-        self._set_selected_region(len(self.overlay.regions) - 1)
+        idx = len(self.overlay.regions) - 1
+        self._set_selected_region(idx)
         self.status.config(text=f"Placed region on {side.upper()} side — press E to edit.")
         self._mark_dirty()
+        if self.open_editor_on_create.get():
+            self.root.after_idle(lambda i=idx: self._open_region_editor(i))
 
     def on_grab_region(self, idx: int) -> None:
         self._set_selected_region(idx)
@@ -1224,6 +1341,7 @@ class App:
         pad = self.overlay.pads[idx]
 
         win = tk.Toplevel(self.root)
+        win.withdraw()
         win.title(f"Pad #{pad.number}")
         win.transient(self.root)
         win.minsize(420, 380)
@@ -1319,21 +1437,33 @@ class App:
             except tk.TclError:
                 pass
 
+        def close_editor(_=None):
+            remember_geometry()
+            win.destroy()
+            return "break"
+
         name_var.trace_add("write", commit_name)
         desc_text.bind("<<Modified>>", commit_description)
         op_var.trace_add("write", commit_opacity)
         size_var.trace_add("write", commit_size)
         win.bind("<Configure>", remember_geometry)
-        win.protocol("WM_DELETE_WINDOW",
-                     lambda: (remember_geometry(), win.destroy()))
+        win.protocol("WM_DELETE_WINDOW", close_editor)
 
         btns = ttk.Frame(frm)
         btns.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         ttk.Button(btns, text="Delete pad", command=delete_pad).pack(side="left")
-        ttk.Button(btns, text="Close",
-                   command=lambda: (remember_geometry(), win.destroy())).pack(side="right")
-        win.bind("<Escape>", lambda e: (remember_geometry(), win.destroy()))
-        name_entry.focus_set()
+        ttk.Button(btns, text="Close", command=close_editor).pack(side="right")
+        ttk.Separator(frm, orient="horizontal").grid(
+            row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        footer = ttk.Frame(frm)
+        footer.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(footer, text="Ctrl+Enter closes", foreground="#888").pack(side="right")
+        win.bind("<Escape>", close_editor)
+        for seq in ("<Control-Return>", "<Control-KP_Enter>"):
+            win.bind(seq, close_editor)
+            name_entry.bind(seq, close_editor)
+            desc_text.bind(seq, close_editor)
+        self._focus_editor(win, name_entry)
         name_entry.icursor("end")
 
     def _open_region_editor(self, idx: int) -> None:
@@ -1342,6 +1472,7 @@ class App:
         region = self.overlay.regions[idx]
 
         win = tk.Toplevel(self.root)
+        win.withdraw()
         win.title(f"Region #{region.number}")
         win.transient(self.root)
         win.minsize(420, 420)
@@ -1457,22 +1588,34 @@ class App:
             except tk.TclError:
                 pass
 
+        def close_editor(_=None):
+            remember_geometry()
+            win.destroy()
+            return "break"
+
         name_var.trace_add("write", commit_name)
         desc_text.bind("<<Modified>>", commit_description)
         op_var.trace_add("write", commit_opacity)
         w_var.trace_add("write", commit_w)
         h_var.trace_add("write", commit_h)
         win.bind("<Configure>", remember_geometry)
-        win.protocol("WM_DELETE_WINDOW",
-                     lambda: (remember_geometry(), win.destroy()))
+        win.protocol("WM_DELETE_WINDOW", close_editor)
 
         btns = ttk.Frame(frm)
         btns.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         ttk.Button(btns, text="Delete region", command=delete_region).pack(side="left")
-        ttk.Button(btns, text="Close",
-                   command=lambda: (remember_geometry(), win.destroy())).pack(side="right")
-        win.bind("<Escape>", lambda e: (remember_geometry(), win.destroy()))
-        name_entry.focus_set()
+        ttk.Button(btns, text="Close", command=close_editor).pack(side="right")
+        ttk.Separator(frm, orient="horizontal").grid(
+            row=8, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        footer = ttk.Frame(frm)
+        footer.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(footer, text="Ctrl+Enter closes", foreground="#888").pack(side="right")
+        win.bind("<Escape>", close_editor)
+        for seq in ("<Control-Return>", "<Control-KP_Enter>"):
+            win.bind(seq, close_editor)
+            name_entry.bind(seq, close_editor)
+            desc_text.bind(seq, close_editor)
+        self._focus_editor(win, name_entry)
         name_entry.icursor("end")
 
     # -------------------------------------------------------- selection
@@ -1651,10 +1794,13 @@ class App:
             self.panel_top.draw(); self.panel_bottom.draw()
         elif mode == "overlay":
             self.overlay.pack(fill="both", expand=True, padx=4)
+            self.overlay.schedule_draw()
         else:
             self.sbs_frame.pack(fill="both", expand=True)
             self.overlay_left.canvas.grid(row=0, column=0, padx=4, sticky="nsew")
             self.overlay_right.canvas.grid(row=0, column=1, padx=4, sticky="nsew")
+            self.overlay_left.schedule_draw()
+            self.overlay_right.schedule_draw()
         self._update_status()
 
     def on_opacity_change(self) -> None:
@@ -1715,11 +1861,34 @@ class App:
         self._refresh_align_button_style()
 
 
-def main() -> None:
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="pcbre",
+        description="Visual reverse-engineering for printed circuit boards.",
+    )
+    parser.add_argument(
+        "project",
+        nargs="?",
+        type=Path,
+        help=f"optional {PROJECT_EXT} project file to open on startup",
+    )
+    args = parser.parse_args(argv)
+    if args.project is not None:
+        args.project = args.project.expanduser()
+        if not args.project.is_file():
+            parser.error(f"project file not found: {args.project}")
+    return args
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
+
     root = tk.Tk()
     try:
         root.tk.call("tk", "scaling", 1.2)
     except tk.TclError:
         pass
-    App(root)
+    app = App(root)
+    if args.project is not None:
+        root.after_idle(lambda path=str(args.project.resolve()): app.open_project(path))
     root.mainloop()
