@@ -37,6 +37,7 @@ Take a top + bottom photo of a PCB. Click a handful of matching vias to lock the
 | Pan | right / middle / Shift+drag |
 | Zoom | scroll wheel |
 | Fit to window | double-click / **Fit View** |
+| Switch overlay layer | **Tab** |
 | Place alignment point | click empty (alignment mode) |
 | Resize alignment point | hold + scroll |
 | Place pad | press & hold ~0.3 s, release |

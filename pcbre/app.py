@@ -286,6 +286,8 @@ class App:
             self.root.bind(seq, lambda e: self._adjust_pad_radius(+1))
         # Esc → drop the current selection (pad / region / point pair).
         self.root.bind("<Escape>", self._on_escape)
+        # Tab toggles the overlay blend between TOP/front and BOTTOM/back.
+        self.root.bind("<Tab>", self._on_tab_key)
         # Arrow keys nudge selected pad(s); Shift+arrow nudges by 10 px.
         for seq, dx, dy in (
             ("<Left>",  -1,  0), ("<Right>",  1,  0),
@@ -493,6 +495,7 @@ class App:
         return [
             "hold = pad",
             "drag = region",
+            "Tab switch layer",
             f"Shift / {MOD}-click pad to multi-select",
             f"{MOD}+A select all",
             "+ / −  default size",
@@ -586,6 +589,16 @@ class App:
             return
         if self.selected is not None:
             self._select(None, None)
+
+    def _on_tab_key(self, e=None) -> str | None:
+        if (self._focused_in_text_input()
+                or not self._is_aligned()
+                or self.single_image_mode
+                or self.mode.get() != "overlay"):
+            return None
+        self.opacity.set(1.0 if self.opacity.get() <= 0.5 else 0.0)
+        self.on_opacity_change()
+        return "break"
 
     def _on_delete_key(self, e=None) -> None:
         if self._focused_in_text_input():
