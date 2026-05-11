@@ -72,13 +72,14 @@ Requires **Python 3.10+**. Tk ships with the stdlib; `numpy` and `Pillow` are pu
 
 ```bash
 uv run pcbre
+uv run pcbre path/to/project.pcbre
 ```
 
 That's it. Equivalent forms if you prefer:
 
 ```bash
-uv run python -m pcbre   # module entry
-uv run python run.py     # convenience launcher
+uv run python -m pcbre path/to/project.pcbre   # module entry
+uv run python run.py path/to/project.pcbre     # convenience launcher
 ```
 
 To grab a shell with the env active (useful for hacking):

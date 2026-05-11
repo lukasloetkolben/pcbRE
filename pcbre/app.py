@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import sys
@@ -1715,11 +1716,34 @@ class App:
         self._refresh_align_button_style()
 
 
-def main() -> None:
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="pcbre",
+        description="Visual reverse-engineering for printed circuit boards.",
+    )
+    parser.add_argument(
+        "project",
+        nargs="?",
+        type=Path,
+        help=f"optional {PROJECT_EXT} project file to open on startup",
+    )
+    args = parser.parse_args(argv)
+    if args.project is not None:
+        args.project = args.project.expanduser()
+        if not args.project.is_file():
+            parser.error(f"project file not found: {args.project}")
+    return args
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
+
     root = tk.Tk()
     try:
         root.tk.call("tk", "scaling", 1.2)
     except tk.TclError:
         pass
-    App(root)
+    app = App(root)
+    if args.project is not None:
+        root.after_idle(lambda path=str(args.project.resolve()): app._do_open(path))
     root.mainloop()
