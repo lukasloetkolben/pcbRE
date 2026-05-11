@@ -516,6 +516,67 @@ class App:
         focused = self.root.focus_get()
         return isinstance(focused, (tk.Entry, ttk.Entry, tk.Text))
 
+    def _center_editor(self, win: tk.Toplevel) -> None:
+        win.update_idletasks()
+        self.root.update_idletasks()
+        min_w, min_h = win.minsize()
+        w = max(min_w, win.winfo_width(), win.winfo_reqwidth())
+        h = max(min_h, win.winfo_height(), win.winfo_reqheight())
+        root_w = self.root.winfo_width()
+        root_h = self.root.winfo_height()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        x = root_x + max(0, (root_w - w) // 2)
+        y = root_y + max(0, (root_h - h) // 2)
+        screen_w = win.winfo_screenwidth()
+        screen_h = win.winfo_screenheight()
+        x = min(max(0, x), max(0, screen_w - w))
+        y = min(max(0, y), max(0, screen_h - h))
+        win.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _focus_editor(self, win: tk.Toplevel, focus_widget: tk.Widget) -> None:
+        def pointer_is_in_app() -> bool:
+            try:
+                widget = self.root.winfo_containing(
+                    self.root.winfo_pointerx(), self.root.winfo_pointery())
+            except tk.TclError:
+                return False
+            if widget is None:
+                return False
+            try:
+                return widget.winfo_toplevel() in (self.root, win)
+            except tk.TclError:
+                return False
+
+        def activate(move_pointer: bool = False) -> None:
+            try:
+                if not win.winfo_exists() or not focus_widget.winfo_exists():
+                    return
+                win.lift(self.root)
+                focus_widget.focus_force()
+                if move_pointer and pointer_is_in_app():
+                    # Focus-follows-mouse WMs would otherwise refocus the
+                    # canvas on the next tiny move if the pointer stayed behind.
+                    focus_widget.event_generate(
+                        "<Motion>",
+                        warp=True,
+                        x=max(1, focus_widget.winfo_width() // 2),
+                        y=max(1, focus_widget.winfo_height() // 2),
+                    )
+            except tk.TclError:
+                pass
+
+        try:
+            self._center_editor(win)
+        except tk.TclError:
+            pass
+        try:
+            win.deiconify()
+        except tk.TclError:
+            pass
+        activate(move_pointer=True)
+        win.after(75, activate)
+
     def _on_e_key(self, e=None) -> None:
         if self._focused_in_text_input() or not self._is_aligned():
             return
@@ -1280,6 +1341,7 @@ class App:
         pad = self.overlay.pads[idx]
 
         win = tk.Toplevel(self.root)
+        win.withdraw()
         win.title(f"Pad #{pad.number}")
         win.transient(self.root)
         win.minsize(420, 380)
@@ -1401,7 +1463,7 @@ class App:
             win.bind(seq, close_editor)
             name_entry.bind(seq, close_editor)
             desc_text.bind(seq, close_editor)
-        name_entry.focus_set()
+        self._focus_editor(win, name_entry)
         name_entry.icursor("end")
 
     def _open_region_editor(self, idx: int) -> None:
@@ -1410,6 +1472,7 @@ class App:
         region = self.overlay.regions[idx]
 
         win = tk.Toplevel(self.root)
+        win.withdraw()
         win.title(f"Region #{region.number}")
         win.transient(self.root)
         win.minsize(420, 420)
@@ -1552,7 +1615,7 @@ class App:
             win.bind(seq, close_editor)
             name_entry.bind(seq, close_editor)
             desc_text.bind(seq, close_editor)
-        name_entry.focus_set()
+        self._focus_editor(win, name_entry)
         name_entry.icursor("end")
 
     # -------------------------------------------------------- selection
