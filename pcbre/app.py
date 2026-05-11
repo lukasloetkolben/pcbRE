@@ -68,6 +68,7 @@ class App:
 
         self.bottom_mirror = tk.BooleanVar(value=True)
         self.opacity = tk.DoubleVar(value=0.5)
+        self.open_editor_on_create = tk.BooleanVar(value=True)
         self.radius = tk.DoubleVar(value=DEFAULT_RADIUS)
         # New projects open straight into overlay once alignment is in place.
         self.mode = tk.StringVar(value="overlay")
@@ -172,6 +173,9 @@ class App:
         ttk.Label(o, text="Opacity:").pack(side="left", padx=(0, 4))
         ttk.Scale(o, from_=0.0, to=1.0, variable=self.opacity, orient="horizontal",
                   length=200, command=lambda *_: self.on_opacity_change()).pack(side="left")
+        ttk.Separator(o, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Checkbutton(o, text="Edit new", variable=self.open_editor_on_create).pack(
+            side="left")
 
     def _build_status_area(self) -> None:
         self.status = ttk.Label(self.root, text="Load a top and bottom image to begin.")
@@ -1100,9 +1104,12 @@ class App:
         )
         self._next_label_number += 1
         self.overlay.pads.append(pad)
-        self._set_selected_pad(len(self.overlay.pads) - 1)
+        idx = len(self.overlay.pads) - 1
+        self._set_selected_pad(idx)
         self.status.config(text=f"Placed pad on {side.upper()} side — press E to edit.")
         self._mark_dirty()
+        if self.open_editor_on_create.get():
+            self.root.after_idle(lambda i=idx: self._open_pad_editor(i))
 
     def on_grab_pad(self, idx: int) -> None:
         self._set_selected_pad(idx)
@@ -1165,9 +1172,12 @@ class App:
         )
         self._next_label_number += 1
         self.overlay.regions.append(region)
-        self._set_selected_region(len(self.overlay.regions) - 1)
+        idx = len(self.overlay.regions) - 1
+        self._set_selected_region(idx)
         self.status.config(text=f"Placed region on {side.upper()} side — press E to edit.")
         self._mark_dirty()
+        if self.open_editor_on_create.get():
+            self.root.after_idle(lambda i=idx: self._open_region_editor(i))
 
     def on_grab_region(self, idx: int) -> None:
         self._set_selected_region(idx)
@@ -1333,20 +1343,32 @@ class App:
             except tk.TclError:
                 pass
 
+        def close_editor(_=None):
+            remember_geometry()
+            win.destroy()
+            return "break"
+
         name_var.trace_add("write", commit_name)
         desc_text.bind("<<Modified>>", commit_description)
         op_var.trace_add("write", commit_opacity)
         size_var.trace_add("write", commit_size)
         win.bind("<Configure>", remember_geometry)
-        win.protocol("WM_DELETE_WINDOW",
-                     lambda: (remember_geometry(), win.destroy()))
+        win.protocol("WM_DELETE_WINDOW", close_editor)
 
         btns = ttk.Frame(frm)
         btns.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         ttk.Button(btns, text="Delete pad", command=delete_pad).pack(side="left")
-        ttk.Button(btns, text="Close",
-                   command=lambda: (remember_geometry(), win.destroy())).pack(side="right")
-        win.bind("<Escape>", lambda e: (remember_geometry(), win.destroy()))
+        ttk.Button(btns, text="Close", command=close_editor).pack(side="right")
+        ttk.Separator(frm, orient="horizontal").grid(
+            row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        footer = ttk.Frame(frm)
+        footer.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(footer, text="Ctrl+Enter closes", foreground="#888").pack(side="right")
+        win.bind("<Escape>", close_editor)
+        for seq in ("<Control-Return>", "<Control-KP_Enter>"):
+            win.bind(seq, close_editor)
+            name_entry.bind(seq, close_editor)
+            desc_text.bind(seq, close_editor)
         name_entry.focus_set()
         name_entry.icursor("end")
 
@@ -1471,21 +1493,33 @@ class App:
             except tk.TclError:
                 pass
 
+        def close_editor(_=None):
+            remember_geometry()
+            win.destroy()
+            return "break"
+
         name_var.trace_add("write", commit_name)
         desc_text.bind("<<Modified>>", commit_description)
         op_var.trace_add("write", commit_opacity)
         w_var.trace_add("write", commit_w)
         h_var.trace_add("write", commit_h)
         win.bind("<Configure>", remember_geometry)
-        win.protocol("WM_DELETE_WINDOW",
-                     lambda: (remember_geometry(), win.destroy()))
+        win.protocol("WM_DELETE_WINDOW", close_editor)
 
         btns = ttk.Frame(frm)
         btns.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         ttk.Button(btns, text="Delete region", command=delete_region).pack(side="left")
-        ttk.Button(btns, text="Close",
-                   command=lambda: (remember_geometry(), win.destroy())).pack(side="right")
-        win.bind("<Escape>", lambda e: (remember_geometry(), win.destroy()))
+        ttk.Button(btns, text="Close", command=close_editor).pack(side="right")
+        ttk.Separator(frm, orient="horizontal").grid(
+            row=8, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        footer = ttk.Frame(frm)
+        footer.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(footer, text="Ctrl+Enter closes", foreground="#888").pack(side="right")
+        win.bind("<Escape>", close_editor)
+        for seq in ("<Control-Return>", "<Control-KP_Enter>"):
+            win.bind(seq, close_editor)
+            name_entry.bind(seq, close_editor)
+            desc_text.bind(seq, close_editor)
         name_entry.focus_set()
         name_entry.icursor("end")
 
