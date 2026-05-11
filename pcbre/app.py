@@ -933,7 +933,7 @@ class App:
             filetypes=[("pcbRE Project", f"*{PROJECT_EXT}"),
                        ("JSON", "*.json"), ("All files", "*.*")])
         if path:
-            self._do_open(path)
+            self.open_project(path)
 
     def _resolve(self, ref: str | None, proj_dir: Path) -> str | None:
         if not ref:
@@ -947,7 +947,7 @@ class App:
         alt = proj_dir / Path(ref).name
         return str(alt) if alt.exists() else None
 
-    def _do_open(self, path: str) -> None:
+    def open_project(self, path: str) -> None:
         try:
             with open(path) as f:
                 doc = json.load(f)
@@ -1890,5 +1890,5 @@ def main(argv: list[str] | None = None) -> None:
         pass
     app = App(root)
     if args.project is not None:
-        root.after_idle(lambda path=str(args.project.resolve()): app._do_open(path))
+        root.after_idle(lambda path=str(args.project.resolve()): app.open_project(path))
     root.mainloop()
