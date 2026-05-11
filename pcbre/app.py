@@ -22,6 +22,7 @@ from .model import (
     Region,
     Side,
     normalize_project_data,
+    normalize_rotation,
     normalize_side,
 )
 from .views import (
@@ -267,6 +268,8 @@ class App:
             self.root.bind(seq, lambda e, f=fn: f())
         self.root.bind("<KeyPress-e>", self._on_e_key)
         self.root.bind("<KeyPress-E>", self._on_e_key)
+        self.root.bind("<KeyPress-r>", self._on_r_key)
+        self.root.bind("<KeyPress-R>", self._on_r_key)
         for seq in ("<Delete>", "<BackSpace>", "<KP_Delete>"):
             self.root.bind(seq, self._on_delete_key)
         # Cmd/Ctrl + = / + / - / 0 → zoom in / zoom out / fit, centered on the
@@ -469,6 +472,7 @@ class App:
                 f"{n_pads} pads selected",
                 "drag = move all",
                 "+ / −  resize",
+                "R rotate text",
                 "arrows nudge",
                 f"{DEL} delete",
                 "Esc deselect",
@@ -480,6 +484,7 @@ class App:
                 f"Pad: {label}",
                 "drag = move",
                 "+ / −  resize",
+                "R rotate text",
                 "arrows nudge",
                 "E edit",
                 f"{DEL} delete",
@@ -523,6 +528,30 @@ class App:
         reg_idx = self.overlay.selected_region
         if reg_idx is not None and reg_idx < len(self.overlay.regions):
             self._open_region_editor(reg_idx)
+
+    def _on_r_key(self, e=None) -> str | None:
+        if self._focused_in_text_input() or not self._is_aligned():
+            return None
+        indices = {
+            idx for idx in self.overlay.selected_pads
+            if 0 <= idx < len(self.overlay.pads)
+        }
+        if not indices:
+            return None
+        for idx in indices:
+            pad = self.overlay.pads[idx]
+            pad.label_rotation = normalize_rotation(pad.label_rotation + 90)
+        self._draw_pad_views()
+        self._mark_dirty()
+        if len(indices) == 1:
+            (idx,) = indices
+            label = self.overlay.pads[idx].name or f"#{self.overlay.pads[idx].number}"
+            self.status.config(
+                text=f"Rotated text for pad {label}: "
+                     f"{self.overlay.pads[idx].label_rotation}°")
+        else:
+            self.status.config(text=f"Rotated text for {len(indices)} pads.")
+        return "break"
 
     def _on_select_all_pads(self, e=None) -> None:
         if self._focused_in_text_input():
@@ -825,6 +854,7 @@ class App:
             "name": p.name, "description": p.description,
             "color": p.color, "opacity": p.opacity, "side": p.side,
             "number": p.number,
+            "label_rotation": p.label_rotation,
         }
 
     @staticmethod
@@ -951,7 +981,9 @@ class App:
                     color=str(p.get("color", "#ff3b30")),
                     opacity=float(p.get("opacity", 0.3)),
                     side=normalize_side(str(p.get("side", "top"))),
-                    number=int(p.get("number", 0)))
+                    number=int(p.get("number", 0)),
+                    label_rotation=normalize_rotation(
+                        p.get("label_rotation", 0)))
                 for p in pads_data
             ]
         except (KeyError, TypeError, ValueError) as e:

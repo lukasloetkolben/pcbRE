@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import tkinter as tk
+import tkinter.font as tkfont
 from typing import Callable
 
 import numpy as np
@@ -44,6 +46,68 @@ POINT_COLORS = [
 
 # Tk event.state mask for any of mouse buttons 1/2/3 held.
 _BUTTON_MASK = 0x700
+_LABEL_FONT_SIZE = 14
+_TEXT_OUTLINE_OFFSETS = (
+    (-1, -1), (0, -1), (1, -1),
+    (-1, 0),           (1, 0),
+    (-1, 1),  (0, 1),  (1, 1),
+)
+_TEXT_FONT_CACHE: dict[int, tkfont.Font] = {}
+_LABEL_FONT_FAMILY_PREFERENCES = (
+    "DejaVu Sans Mono", "Menlo", "Monaco", "Consolas", "Courier New",
+)
+
+
+def _relative_luminance(hex_color: str) -> float:
+    def channel(v: int) -> float:
+        c = v / 255.0
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    r, g, b = hex_to_rgb(hex_color)
+    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+
+
+def _text_border_color(fill: str) -> str:
+    luminance = _relative_luminance(fill)
+    black_contrast = (luminance + 0.05) / 0.05
+    white_contrast = 1.05 / (luminance + 0.05)
+    return "#000000" if black_contrast >= white_contrast else "#ffffff"
+
+
+def _label_font(canvas: tk.Canvas) -> tkfont.Font:
+    key = id(canvas.tk)
+    font = _TEXT_FONT_CACHE.get(key)
+    if font is None:
+        available = {
+            family.casefold(): family for family in tkfont.families(root=canvas)
+        }
+        family = None
+        for preferred in _LABEL_FONT_FAMILY_PREFERENCES:
+            family = available.get(preferred.casefold())
+            if family is not None:
+                break
+        try:
+            default_family = tkfont.nametofont(
+                "TkDefaultFont", root=canvas).actual("family")
+        except tk.TclError:
+            default_family = ""
+        if family is None and default_family.casefold() != "fixed":
+            family = default_family
+        if family is None:
+            family = next(iter(available.values()), "Helvetica")
+        font = tkfont.Font(
+            root=canvas, family=family, size=_LABEL_FONT_SIZE, weight="bold")
+        _TEXT_FONT_CACHE[key] = font
+    return font
+
+
+def _create_outlined_text(canvas: tk.Canvas, x: float, y: float, *,
+                          fill: str, **kwargs) -> int:
+    outline = _text_border_color(fill)
+    kwargs.setdefault("font", _label_font(canvas))
+    for dx, dy in _TEXT_OUTLINE_OFFSETS:
+        canvas.create_text(x + dx, y + dy, fill=outline, **kwargs)
+    return canvas.create_text(x, y, fill=fill, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +505,8 @@ class Panel(ImageView):
             c.create_oval(X - R, Y - R, X + R, Y + R, outline=color, width=2)
             c.create_oval(X - 3, Y - 3, X + 3, Y + 3, fill=color, outline="white")
             label = f"{i + 1}  r={pt.r}px" if i == self.selected_index else str(i + 1)
-            c.create_text(X + R + 8, Y, text=label, fill=color, anchor="w",
-                          font=("TkDefaultFont", 10, "bold"))
+            _create_outlined_text(
+                c, X + R + 8, Y, text=label, fill=color, anchor="w")
 
 
 # ---------------------------------------------------------------------------
@@ -1367,8 +1431,8 @@ class OverlayView(ImageView):
                     c.create_oval(hx - hr, hy - hr, hx + hr, hy + hr,
                                   fill=halo, outline=color, width=2)
             label = reg.name or f"#{reg.number or i + 1}"
-            c.create_text(X1 + 6, Y0, text=label, fill=color, anchor="nw",
-                          font=("TkDefaultFont", 10, "bold"))
+            _create_outlined_text(
+                c, X1 + 6, Y0, text=label, fill=color, anchor="nw")
 
         # In-progress region creation: dashed preview.
         if self._region_create_start is not None and self._region_create_end is not None:
@@ -1404,6 +1468,11 @@ class OverlayView(ImageView):
                     c.create_line(X - R - 6, Y, X + R + 6, Y, fill=halo)
                     c.create_line(X, Y - R - 6, X, Y + R + 6, fill=halo)
             label = p.name or f"#{p.number or i + 1}"
-            c.create_text(X + R + 6, Y, text=label, fill=color, anchor="w",
-                          font=("TkDefaultFont", 10, "bold"))
+            label_offset = R + 6
+            label_angle = math.radians(p.label_rotation)
+            label_x = X + math.cos(label_angle) * label_offset
+            label_y = Y + math.sin(label_angle) * label_offset
+            _create_outlined_text(
+                c, label_x, label_y, text=label, fill=color, anchor="w",
+                angle=-p.label_rotation)
         self._tooltip.draw_into()

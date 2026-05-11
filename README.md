@@ -16,7 +16,7 @@ Take a top + bottom photo of a PCB. Click a handful of matching vias to lock the
 1. **Load Top** + **Load Bottom**, toggle **Mirror Bottom** so both sides read the same way.
 2. Zoom in, click matching vias on each side. **3 pairs** → affine, **4+** → perspective homography (least-squares fit).
 3. Hit **Align**. The setup toolbar collapses, side-by-side and overlay views light up.
-4. **Press & hold ~0.3 s** anywhere to drop a pad. Drag, scroll while held to resize, press **E** to edit (name, description, color, opacity, size).
+4. **Press & hold ~0.3 s** anywhere to drop a pad. Drag, scroll while held to resize, press **E** to edit (name, description, color, opacity, size) or **R** to rotate its label.
 5. **Save Project** — image paths, alignment points, view rotation/flip, every pad → tiny `.pcbre` JSON.
 
 ## Highlights
@@ -43,6 +43,7 @@ Take a top + bottom photo of a PCB. Click a handful of matching vias to lock the
 | Place pad | press & hold ~0.3 s, release |
 | Resize pad | hold + scroll |
 | Edit selected pad | **E** |
+| Rotate selected pad text | **R** |
 | Deselect pad | click empty |
 | Save / Save As / Open | Ctrl/Cmd+S / Ctrl/Cmd+Shift+S / Ctrl/Cmd+O |
 
@@ -98,7 +99,7 @@ A `.pcbre` file is plain JSON with:
 - `bot_mirror` — mirror state at the time of save
 - `view_rotation` / `view_flipped` — overlay orientation
 - `top_points` / `bot_points` — alignment correspondences (`x`, `y`, `r`)
-- `pads` — every named pad (`x`, `y`, `r`, `name`, `description`, `color`, `opacity`, `side`)
+- `pads` — every named pad (`x`, `y`, `r`, `name`, `description`, `color`, `opacity`, `side`, `label_rotation`)
 
 Move the source images and the `.pcbre` together — paths are resolved relative to the project file.
 
