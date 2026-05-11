@@ -1731,10 +1731,13 @@ class App:
             self.panel_top.draw(); self.panel_bottom.draw()
         elif mode == "overlay":
             self.overlay.pack(fill="both", expand=True, padx=4)
+            self.overlay.schedule_draw()
         else:
             self.sbs_frame.pack(fill="both", expand=True)
             self.overlay_left.canvas.grid(row=0, column=0, padx=4, sticky="nsew")
             self.overlay_right.canvas.grid(row=0, column=1, padx=4, sticky="nsew")
+            self.overlay_left.schedule_draw()
+            self.overlay_right.schedule_draw()
         self._update_status()
 
     def on_opacity_change(self) -> None:

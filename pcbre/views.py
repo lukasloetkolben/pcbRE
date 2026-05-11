@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import math
 import tkinter as tk
 import tkinter.font as tkfont
@@ -46,6 +47,7 @@ POINT_COLORS = [
 
 # Tk event.state mask for any of mouse buttons 1/2/3 held.
 _BUTTON_MASK = 0x700
+_SCALED_CROP_CACHE_LIMIT = 4
 _LABEL_FONT_SIZE = 14
 _TEXT_OUTLINE_OFFSETS = (
     (-1, -1), (0, -1), (1, -1),
@@ -56,6 +58,23 @@ _TEXT_FONT_CACHE: dict[int, tkfont.Font] = {}
 _LABEL_FONT_FAMILY_PREFERENCES = (
     "DejaVu Sans Mono", "Menlo", "Monaco", "Consolas", "Courier New",
 )
+
+
+def _resize_crop(src: Image.Image, box: tuple[int, int, int, int],
+                 size: tuple[int, int]) -> Image.Image:
+    """Return `box` scaled to `size` with the normal full-quality resampler."""
+    crop_w = box[2] - box[0]
+    crop_h = box[3] - box[1]
+    if size == (crop_w, crop_h):
+        return src.crop(box)
+    return src.resize(size, BILINEAR, box=box)
+
+
+def _cache_put(cache: OrderedDict, key: tuple, value) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > _SCALED_CROP_CACHE_LIMIT:
+        cache.popitem(last=False)
 
 
 def _relative_luminance(hex_color: str) -> float:
@@ -127,6 +146,7 @@ class ImageView:
         self._pan_anchor: tuple[int, int, float, float] | None = None
         self._fitted_once = False
         self._pending = False
+        self._draw_when_mapped = False
 
         c = self.canvas
         c.bind("<MouseWheel>", self._on_wheel)
@@ -134,6 +154,7 @@ class ImageView:
         c.bind("<Button-5>", self._on_wheel)
         c.bind("<Double-Button-1>", lambda e: self.fit())
         c.bind("<Configure>", self._on_configure)
+        c.bind("<Map>", self._on_map)
         # Right/middle button drag is handled by _pan_start/_pan_drag in the
         # subclass bindings; without an explicit release binding the
         # pan_anchor leaks and trips up the next gesture's release path.
@@ -151,6 +172,12 @@ class ImageView:
 
     def pack(self, **kw): self.canvas.pack(**kw)
     def pack_forget(self): self.canvas.pack_forget()
+
+    def _is_drawable(self) -> bool:
+        try:
+            return bool(self.canvas.winfo_ismapped())
+        except tk.TclError:
+            return False
 
     def _cw(self) -> int:
         w = int(self.canvas.winfo_width())
@@ -179,6 +206,9 @@ class ImageView:
         self.schedule_draw()
 
     def schedule_draw(self) -> None:
+        if not self._is_drawable():
+            self._draw_when_mapped = True
+            return
         if self._pending:
             return
         self._pending = True
@@ -186,9 +216,15 @@ class ImageView:
 
     def _render(self) -> None:
         self._pending = False
+        if not self._is_drawable():
+            self._draw_when_mapped = True
+            return
         self.draw()
 
     def draw(self) -> None:
+        if not self._is_drawable():
+            self._draw_when_mapped = True
+            return
         c = self.canvas
         c.delete("all")
         cw, ch = self._cw(), self._ch()
@@ -238,6 +274,11 @@ class ImageView:
         if not self._fitted_once and e.width > 1 and e.height > 1:
             self.fit()
         else:
+            self.schedule_draw()
+
+    def _on_map(self, e=None) -> None:
+        if self._draw_when_mapped or self._content_size() is not None:
+            self._draw_when_mapped = False
             self.schedule_draw()
 
 
@@ -359,6 +400,7 @@ class Panel(ImageView):
         self.image: Image.Image | None = None
         self.points: list[Point] = []
         self.selected_index: int | None = None
+        self._scaled_cache: OrderedDict[tuple, Image.Image] = OrderedDict()
 
         self._press_orig: tuple[float, float] | None = None
         self._press_canvas: tuple[int, int] | None = None
@@ -383,6 +425,7 @@ class Panel(ImageView):
 
     def set_image(self, img: Image.Image | None) -> None:
         self.image = img
+        self._scaled_cache.clear()
         self._fitted_once = False
         self.canvas.update_idletasks()
         self.fit()
@@ -482,21 +525,33 @@ class Panel(ImageView):
                                 font=("TkDefaultFont", 12))
 
     def _draw_content(self, ix0: int, iy0: int, ix1: int, iy1: int) -> None:
-        crop = self.image.crop((ix0, iy0, ix1, iy1))
         new_w = max(1, int(round((ix1 - ix0) * self.zoom)))
         new_h = max(1, int(round((iy1 - iy0) * self.zoom)))
-        self._photo = ImageTk.PhotoImage(crop.resize((new_w, new_h), BILINEAR))
+        key = (ix0, iy0, ix1, iy1, new_w, new_h, id(self.image))
+        crop = self._scaled_cache.get(key)
+        if crop is not None:
+            self._scaled_cache.move_to_end(key)
+        else:
+            crop = _resize_crop(self.image, (ix0, iy0, ix1, iy1),
+                                (new_w, new_h))
+            _cache_put(self._scaled_cache, key, crop)
+        self._photo = ImageTk.PhotoImage(crop)
         cx0 = (ix0 - self.ox) * self.zoom
         cy0 = (iy0 - self.oy) * self.zoom
         self.canvas.create_image(cx0, cy0, anchor="nw", image=self._photo)
 
     def _draw_overlays(self) -> None:
         c = self.canvas
+        cw, ch = self._cw(), self._ch()
+        margin = 120.0
         for i, pt in enumerate(self.points):
             color = POINT_COLORS[i % len(POINT_COLORS)]
             X = (pt.x - self.ox) * self.zoom
             Y = (pt.y - self.oy) * self.zoom
             R = max(3.0, pt.r * self.zoom)
+            if (X + R < -margin or Y + R < -margin
+                    or X - R > cw + margin or Y - R > ch + margin):
+                continue
             if i == self.selected_index:
                 c.create_oval(X - R - 4, Y - R - 4, X + R + 4, Y + R + 4,
                               outline="white", width=2)
@@ -650,11 +705,12 @@ class OverlayView(ImageView):
 
         # Cache for the cropped-and-resized base images. The resize from a
         # multi-megapixel source to canvas resolution is the dominant cost per
-        # frame, and it doesn't depend on alpha — so we reuse it across opacity
-        # drags. Keyed on view bounds + zoom + image identity.
-        self._scaled_cache_key: tuple | None = None
-        self._scaled_cache_top: Image.Image | None = None
-        self._scaled_cache_warped: Image.Image | None = None
+        # frame, and it doesn't depend on alpha or selection state. Keep a few
+        # exact full-quality entries so redraws from opacity, hover, and
+        # selection changes do not redo the same crop+resize immediately.
+        self._scaled_cache: OrderedDict[
+            tuple, tuple[Image.Image, Image.Image | None]
+        ] = OrderedDict()
 
         self._press_view: tuple[float, float] | None = None
         self._press_canvas: tuple[int, int] | None = None
@@ -794,9 +850,7 @@ class OverlayView(ImageView):
             self.schedule_draw()
 
     def _invalidate_scaled_cache(self) -> None:
-        self._scaled_cache_key = None
-        self._scaled_cache_top = None
-        self._scaled_cache_warped = None
+        self._scaled_cache.clear()
 
     def rotate_cw(self) -> None:
         self.rotation = (self.rotation + 90) % 360
@@ -1308,17 +1362,40 @@ class OverlayView(ImageView):
     def _draw_content(self, ix0: int, iy0: int, ix1: int, iy1: int) -> None:
         new_w = max(1, int(round((ix1 - ix0) * self.zoom)))
         new_h = max(1, int(round((iy1 - iy0) * self.zoom)))
-        crop_t, crop_w = self._scaled_crops(ix0, iy0, ix1, iy1, new_w, new_h)
         if self.single_source is None:
-            blend = Image.blend(crop_t, crop_w, self.alpha)
+            if self._top_view is self._warped_view or self.alpha <= 0.0:
+                blend = self._scaled_source("top", ix0, iy0, ix1, iy1,
+                                            new_w, new_h)
+            elif self.alpha >= 1.0:
+                blend = self._scaled_source("warped", ix0, iy0, ix1, iy1,
+                                            new_w, new_h)
+            else:
+                crop_t, crop_w = self._scaled_crops(
+                    ix0, iy0, ix1, iy1, new_w, new_h)
+                blend = Image.blend(crop_t, crop_w, self.alpha)
         else:
-            blend = crop_t  # safe: _composite_overlays returns a fresh image
+            blend = self._scaled_source(self.single_source, ix0, iy0, ix1,
+                                        iy1, new_w, new_h)
         if self.pads or self.regions:
             blend = self._composite_overlays(blend, ix0, iy0, new_w, new_h)
         self._photo = ImageTk.PhotoImage(blend)
         cx0 = (ix0 - self.ox) * self.zoom
         cy0 = (iy0 - self.oy) * self.zoom
         self.canvas.create_image(cx0, cy0, anchor="nw", image=self._photo)
+
+    def _scaled_source(self, source: str,
+                       ix0: int, iy0: int, ix1: int, iy1: int,
+                       new_w: int, new_h: int) -> Image.Image:
+        src = self._top_view if source == "top" else self._warped_view
+        key = ("source", source, ix0, iy0, ix1, iy1, new_w, new_h, id(src))
+        cached = self._scaled_cache.get(key)
+        if cached is not None:
+            self._scaled_cache.move_to_end(key)
+            return cached[0]
+
+        crop = _resize_crop(src, (ix0, iy0, ix1, iy1), (new_w, new_h))
+        _cache_put(self._scaled_cache, key, (crop, None))
+        return crop
 
     def _scaled_crops(self, ix0: int, iy0: int, ix1: int, iy1: int,
                       new_w: int, new_h: int) -> tuple[Image.Image, Image.Image | None]:
@@ -1329,39 +1406,49 @@ class OverlayView(ImageView):
         """
         key = (ix0, iy0, ix1, iy1, new_w, new_h,
                id(self._top_view), id(self._warped_view), self.single_source)
-        if key == self._scaled_cache_key:
-            return self._scaled_cache_top, self._scaled_cache_warped
+        cached = self._scaled_cache.get(key)
+        if cached is not None:
+            self._scaled_cache.move_to_end(key)
+            return cached
 
         if self.single_source is None:
-            crop_t = self._top_view.crop((ix0, iy0, ix1, iy1))
-            crop_w = self._warped_view.crop((ix0, iy0, ix1, iy1))
-            if (new_w, new_h) != crop_t.size:
-                crop_t = crop_t.resize((new_w, new_h), BILINEAR)
-                crop_w = crop_w.resize((new_w, new_h), BILINEAR)
+            crop_t = _resize_crop(self._top_view, (ix0, iy0, ix1, iy1),
+                                  (new_w, new_h))
+            crop_w = _resize_crop(self._warped_view, (ix0, iy0, ix1, iy1),
+                                  (new_w, new_h))
         else:
-            src = self._top_view if self.single_source == "top" else self._warped_view
-            crop_t = src.crop((ix0, iy0, ix1, iy1))
-            if (new_w, new_h) != crop_t.size:
-                crop_t = crop_t.resize((new_w, new_h), BILINEAR)
+            src = (self._top_view if self.single_source == "top"
+                   else self._warped_view)
+            crop_t = _resize_crop(src, (ix0, iy0, ix1, iy1), (new_w, new_h))
             crop_w = None
 
-        self._scaled_cache_key = key
-        self._scaled_cache_top = crop_t
-        self._scaled_cache_warped = crop_w
-        return crop_t, crop_w
+        value = (crop_t, crop_w)
+        _cache_put(self._scaled_cache, key, value)
+        return value
 
     def _composite_overlays(self, blend: Image.Image,
                             ix0: int, iy0: int,
                             new_w: int, new_h: int) -> Image.Image:
-        layer: Image.Image | None = None
-        draw: ImageDraw.ImageDraw | None = None
+        commands: list[tuple[str, tuple[float, float, float, float],
+                             tuple[int, int, int, int]]] = []
+        bx0, by0 = new_w, new_h
+        bx1 = by1 = 0
 
-        def ensure_layer():
-            nonlocal layer, draw
-            if layer is None:
-                layer = Image.new("RGBA", (new_w, new_h), (0, 0, 0, 0))
-                draw = ImageDraw.Draw(layer)
-            return draw
+        def add_command(kind: str, coords: tuple[float, float, float, float],
+                        fill: tuple[int, int, int, int]) -> None:
+            nonlocal bx0, by0, bx1, by1
+            x0, y0, x1, y1 = coords
+            cbx0 = max(0, int(math.floor(min(x0, x1))))
+            cby0 = max(0, int(math.floor(min(y0, y1))))
+            cbx1 = min(new_w, int(math.ceil(max(x0, x1))) + 1)
+            cby1 = min(new_h, int(math.ceil(max(y0, y1))) + 1)
+            if cbx1 <= cbx0 or cby1 <= cby0:
+                return
+            commands.append((kind, coords, fill))
+            bx0 = min(bx0, cbx0)
+            by0 = min(by0, cby0)
+            bx1 = max(bx1, cbx1)
+            by1 = max(by1, cby1)
 
         # Regions first so pads paint on top.
         for reg in self.regions:
@@ -1376,9 +1463,8 @@ class OverlayView(ImageView):
             if cx1 < 0 or cy1 < 0 or cx0 > new_w or cy0 > new_h:
                 continue
             a = int(round(max(0.0, min(1.0, reg.opacity * vis)) * 255))
-            ensure_layer().rectangle(
-                [cx0, cy0, cx1, cy1],
-                fill=hex_to_rgb(reg.color) + (a,))
+            add_command("rectangle", (cx0, cy0, cx1, cy1),
+                        hex_to_rgb(reg.color) + (a,))
 
         for p in self.pads:
             vis = self._side_visibility(p.side)
@@ -1388,19 +1474,35 @@ class OverlayView(ImageView):
             cx = (vx - ix0) * self.zoom
             cy = (vy - iy0) * self.zoom
             r = p.r * self.zoom
-            if cx + r < 0 or cy + r < 0 or cx - r > new_w or cy - r > new_h:
+            if (cx + r < 0 or cy + r < 0
+                    or cx - r > new_w or cy - r > new_h):
                 continue
             a = int(round(max(0.0, min(1.0, p.opacity * vis)) * 255))
-            ensure_layer().ellipse(
-                [cx - r, cy - r, cx + r, cy + r],
-                fill=hex_to_rgb(p.color) + (a,))
+            add_command("ellipse", (cx - r, cy - r, cx + r, cy + r),
+                        hex_to_rgb(p.color) + (a,))
 
-        if layer is None:
+        if not commands:
             return blend
-        return Image.alpha_composite(blend.convert("RGBA"), layer).convert("RGB")
+
+        layer = Image.new("RGBA", (bx1 - bx0, by1 - by0), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        for kind, (x0, y0, x1, y1), fill in commands:
+            coords = [x0 - bx0, y0 - by0, x1 - bx0, y1 - by0]
+            if kind == "rectangle":
+                draw.rectangle(coords, fill=fill)
+            else:
+                draw.ellipse(coords, fill=fill)
+
+        patch = blend.crop((bx0, by0, bx1, by1)).convert("RGBA")
+        patch = Image.alpha_composite(patch, layer).convert("RGB")
+        out = blend.copy()
+        out.paste(patch, (bx0, by0))
+        return out
 
     def _draw_overlays(self) -> None:
         c = self.canvas
+        cw, ch = self._cw(), self._ch()
+        margin = 140.0
 
         # Regions (drawn under pads so a pad on top of a region stays readable).
         for i, reg in enumerate(self.regions):
@@ -1413,6 +1515,10 @@ class OverlayView(ImageView):
             Y0 = (ry0 - self.oy) * self.zoom
             X1 = (rx1 - self.ox) * self.zoom
             Y1 = (ry1 - self.oy) * self.zoom
+            if (max(X0, X1) < -margin or max(Y0, Y1) < -margin
+                    or min(X0, X1) > cw + margin
+                    or min(Y0, Y1) > ch + margin):
+                continue
             is_sel = i == self.selected_region
             c.create_rectangle(X0, Y0, X1, Y1, outline=color,
                                width=3 if is_sel else 2)
@@ -1454,6 +1560,9 @@ class OverlayView(ImageView):
             X = (vx - self.ox) * self.zoom
             Y = (vy - self.oy) * self.zoom
             R = max(3.0, p.r * self.zoom)
+            if (X + R < -margin or Y + R < -margin
+                    or X - R > cw + margin or Y - R > ch + margin):
+                continue
             is_in_set = i in self.selected_pads
             is_primary = i == self.selected_pad
             c.create_oval(X - R, Y - R, X + R, Y + R,
